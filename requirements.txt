@@ -1,0 +1,8 @@
+torch>=2.5.0
+flash-linear-attention>=0.4.2   # GatedDeltaNet, Triton kernels
+fla-core>=0.4.2
+transformers>=4.45.0
+datasets>=3.0.0
+accelerate>=1.0.0
+safetensors
+tqdm
