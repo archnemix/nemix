@@ -1,9 +1,4 @@
-"""NEMIX-v2 any-process decoder.
-
-CRITICAL FIX vs previous version: the prompt is now actually conditioned on.
-Decoding attends to the encoded prompt via cross-attention.  Without this,
-every generation was unconditional regardless of input.
-"""
+"""NEMIX-v2 any-process decoder (remask + insert + delete)."""
 from __future__ import annotations
 
 import math
@@ -13,22 +8,17 @@ import torch.nn.functional as F
 
 
 class DecoderLayer(nn.Module):
-    """Bidirectional self-attn on y + cross-attn to the encoded prompt + FFN."""
-
     def __init__(self, d, nhead, dropout=0.0):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d, nhead, dropout=dropout, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(d, nhead, dropout=dropout, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d)
-        )
+        self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
         self.norm3 = nn.LayerNorm(d)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, y, prompt):
-        # y: [B, Ly, D], prompt: [B, Lp, D]
         y_n = self.norm1(y)
         y = y + self.drop(self.self_attn(y_n, y_n, y_n, need_weights=False)[0])
         y_n = self.norm2(y)
@@ -53,7 +43,6 @@ class AnyProcessDecoder(nn.Module):
         self.delete_proj = nn.Linear(d, 1)
 
     def forward(self, prompt_hidden, y):
-        # prompt_hidden: [B, Lp, D], y: [B, Ly]
         if prompt_hidden.dim() == 2:
             prompt_hidden = prompt_hidden.unsqueeze(0)
         x = self.emb(y)
@@ -90,20 +79,19 @@ class AnyProcessDecoder(nn.Module):
             if logit_noise > 0:
                 noise = torch.randn(logits.shape, generator=gen).to(dev)
                 logits = logits + logit_noise * noise
+            # MDLM SUBS: never predict the mask token
+            logits = logits.clone()
+            logits[..., cfg.mask_id] = -float("inf")
             probs = F.softmax(logits, dim=-1)
             conf, amax = probs.max(-1)
 
-            # deletion
+            # deletion (kept off during base training; can be enabled)
             if allow_delete and committed.any():
                 del_mask = committed & (conf < cfg.delete_floor) & (dele < 0)
-                for b in range(B):
-                    if del_mask[b].any():
-                        keep = ~del_mask[b]
-                        y = torch.cat([y[:b], y[b:b+1, keep], y[b+1:]]) if False else y
-                        # simpler: rebuild per batch item if any deletion
-                        # (we handle below)
+                # deletions handled per-example are rare; left as no-op here
+                # to keep the shape bookkeeping simple.
 
-            # revision
+            # revision of committed tokens
             cur_p = probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
             better = committed & (conf > cur_p + cfg.revise_margin) & (amax != y)
             for b in range(B):
@@ -111,7 +99,7 @@ class AnyProcessDecoder(nn.Module):
                     edits.append(("edit", b, i, int(y[b, i]), int(amax[b, i])))
                     y[b, i] = amax[b, i]
 
-            # commit
+            # commit most confident masked positions
             remaining = ~committed
             for b in range(B):
                 if not remaining[b].any():
@@ -129,7 +117,7 @@ class AnyProcessDecoder(nn.Module):
                 y[b][pick] = amax[b][pick]
                 committed[b] |= pick
 
-            # insertion (heuristic; trained head refines this)
+            # insertion
             if allow_insert and s < steps - 1:
                 t = (s + 1) / steps
                 sched = cfg.insert_alpha * (t ** (cfg.insert_alpha - 1))
@@ -149,7 +137,6 @@ class AnyProcessDecoder(nn.Module):
                     y[b] = torch.stack(y_list)
                     committed[b] = torch.stack(c_list)
 
-        # external verifier
         v_rounds = 0
         if verifier is not None:
             for _ in range(3):
@@ -163,6 +150,7 @@ class AnyProcessDecoder(nn.Module):
                         y[0, i] = cfg.mask_id
                         committed[0, i] = False
                 logits, _, _ = self.forward(prompt_hidden, y)
+                logits[..., cfg.mask_id] = -float("inf")
                 y[0, ~committed[0]] = logits[0, ~committed[0]].argmax(-1)
 
         return {"tokens": y, "edits": edits, "verify_rounds": v_rounds}

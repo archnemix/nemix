@@ -1,4 +1,13 @@
-"""NEMIX-v2 backbone: Gated DeltaNet + gist memory sidecar."""
+"""NEMIX-v2 backbone: Gated DeltaNet + gist memory sidecar.
+
+Fixes vs the previous version on disk:
+  * GatedDeltaNet.forward returns (hidden, attn_weights, past_kv), not a
+    bare tensor.  Unpack defensively so the same GDNBlock also works with
+    the nn.TransformerEncoderLayer fallback (which returns a tensor).
+  * nn.Embedding's default N(0, 1) init produces logits of std ~sqrt(d)
+    and an initial cross-entropy ~200 when the embedding is weight-tied
+    to the LM head.  Force std=0.02 so the initial loss is ~log(V).
+"""
 from __future__ import annotations
 
 import torch
@@ -12,30 +21,47 @@ except ImportError:
     GatedDeltaNet = None
 
 
+def _unpack_mixer_output(out):
+    """fla's GatedDeltaNet returns (hidden, attn_weights, past_kv) or similar.
+    Return only the hidden tensor; pass tensors through unchanged."""
+    if isinstance(out, tuple):
+        return out[0]
+    return out
+
+
 class GDNBlock(nn.Module):
-    """Gated DeltaNet mixer + SwiGLU FFN.  Falls back to attention if fla missing."""
+    """Gated DeltaNet mixer + SwiGLU FFN."""
 
     def __init__(self, cfg):
         super().__init__()
         self.norm1 = nn.RMSNorm(cfg.d_model)
         if GatedDeltaNet is not None:
-            kwargs = dict(
-                hidden_size=cfg.d_model,
-                num_heads=cfg.n_heads,
-                mode="chunk",
-                expand_v=cfg.expand_v,
-                use_gate=cfg.use_gate,
-            )
             try:
-                self.mixer = GatedDeltaNet(**kwargs, chunk_size=cfg.chunk_size)
+                self.mixer = GatedDeltaNet(
+                    hidden_size=cfg.d_model,
+                    num_heads=cfg.n_heads,
+                    mode="chunk",
+                    expand_v=cfg.expand_v,
+                    use_gate=cfg.use_gate,
+                    chunk_size=cfg.chunk_size,
+                )
             except TypeError:
                 # older fla versions do not accept chunk_size
-                self.mixer = GatedDeltaNet(**kwargs)
+                self.mixer = GatedDeltaNet(
+                    hidden_size=cfg.d_model,
+                    num_heads=cfg.n_heads,
+                    mode="chunk",
+                    expand_v=cfg.expand_v,
+                    use_gate=cfg.use_gate,
+                )
         else:
-            # graceful fallback so imports never fail on machines without fla
+            # fallback if fla is unavailable on this machine
             self.mixer = nn.TransformerEncoderLayer(
-                d_model=cfg.d_model, nhead=cfg.n_heads,
-                dim_feedforward=4 * cfg.d_model, batch_first=True, norm_first=True,
+                d_model=cfg.d_model,
+                nhead=cfg.n_heads,
+                dim_feedforward=4 * cfg.d_model,
+                batch_first=True,
+                norm_first=True,
             )
         self.norm2 = nn.RMSNorm(cfg.d_model)
         self.ffn = nn.Sequential(
@@ -45,7 +71,8 @@ class GDNBlock(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.mixer(self.norm1(x))
+        mixed = _unpack_mixer_output(self.mixer(self.norm1(x)))
+        x = x + mixed
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -55,6 +82,11 @@ class NEMIXBackbone(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        # Weight tying means this matrix is also the LM head.  Default
+        # N(0, 1) init gives std ~sqrt(d) logits and an initial loss ~200.
+        # std=0.02 puts the initial loss at ~log(vocab_size) ≈ 10.4.
+        nn.init.normal_(self.emb.weight, std=0.02)
+
         self.layers = nn.ModuleList(GDNBlock(cfg) for _ in range(cfg.n_layers))
         self.norm_f = nn.RMSNorm(cfg.d_model)
 
@@ -68,14 +100,13 @@ class NEMIXBackbone(nn.Module):
             max_salient=cfg.max_salient_tokens,
         )
         if unigram_log_probs is None:
-            # uniform log-probability (not -9 constant, which would make every token equally salient)
             unigram_log_probs = torch.full(
-                (cfg.vocab_size,), -torch.log(torch.tensor(float(cfg.vocab_size))).item()
+                (cfg.vocab_size,),
+                -torch.log(torch.tensor(float(cfg.vocab_size))).item(),
             )
         self.register_buffer("unigram_log_probs", unigram_log_probs.float())
 
     def stream(self, ids, write=True):
-        """ids: [B, T] or [T].  Returns dict with 'hidden' [B, T, D]."""
         squeeze = ids.dim() == 1
         if squeeze:
             ids = ids.unsqueeze(0)
