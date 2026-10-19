@@ -5,17 +5,20 @@ from dataclasses import dataclass
 @dataclass
 class NEMIXConfig:
     # ---- vocabulary -------------------------------------------------
-    vocab_size: int = 32256
-    pad_id: int = 0
-    mask_id: int = 1
-    bos_id: int = 2
-    eos_id: int = 3
+    # Reserved slots past the deepseek-coder tokenizer range (0..32255).
+    # mask_id/pad_id/bos_id/eos_id must NOT collide with real tokens or
+    # CE against a target that happens to be mask_id produces +inf → NaN.
+    vocab_size: int = 32260
+    pad_id: int = 32257
+    mask_id: int = 32256
+    bos_id: int = 32258
+    eos_id: int = 32259
     tokenizer_path: str = "deepseek-ai/deepseek-coder-6.7b-base"
 
     # ---- Gated DeltaNet backbone (20M target) ------------------------
-    d_model: int = 288
+    d_model: int = 256
     n_heads: int = 4
-    n_layers: int = 4
+    n_layers: int = 2
     expand_v: float = 2.0
     use_gate: bool = True
 
@@ -24,12 +27,12 @@ class NEMIXConfig:
     n_recurrent: int = 1
     n_coda: int = 1
     max_loop_iters: int = 2
-    use_act: bool = False            # OFF at 20M: halting head adds noise
+    use_act: bool = False
     act_threshold: float = 0.99
     act_penalty_weight: float = 1e-3
 
     # ---- any-process decoder ----------------------------------------
-    n_dec_layers: int = 2
+    n_dec_layers: int = 1
     block_size: int = 256
     refine_steps: int = 8
     commit_per_step: float = 0.15
@@ -39,10 +42,10 @@ class NEMIXConfig:
     delete_floor: float = 0.01
 
     # ---- MDM / Rao-Blackwellized loss -------------------------------
-    elbo_max_weight: float = 5.0     # clamp on 1/alpha_t so gradients stay finite
-    mask_warmup_start: float = 0.15  # initial t_max (15% mask, like BERT)
-    mask_warmup_steps: int = 1000    # steps to reach t_max = 1.0
-    aux_weight: float = 0.0          # insertion/deletion BCE off during base training
+    elbo_max_weight: float = 5.0
+    mask_warmup_start: float = 0.15
+    mask_warmup_steps: int = 500
+    aux_weight: float = 0.0
 
     # ---- gist memory ------------------------------------------------
     gist_dim: int = 128
@@ -73,11 +76,11 @@ class NEMIXConfig:
     fused_norm: bool = False
 
     # ---- training ----------------------------------------------------
-    lr: float = 1e-4                 # MDLM stable recipe (was 3e-4)
+    lr: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
-    grad_clip_norm: float = 1.0      # single clip for all params
+    grad_clip_norm: float = 1.0
     batch_size: int = 16
-    grad_accum: int = 2
+    grad_accum: int = 1
     max_seq_len: int = 512
     seed: int = 0
