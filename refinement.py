@@ -1,4 +1,7 @@
-"""NEMIX-v2 any-process decoder (remask + insert + delete)."""
+"""NEMIX-v3 any-process decoder: remask + insert + delete, plus
+reliability-guided remasking (PRISM), leftward relaxation (PURE/T2M),
+token-level halting (MoR/LoopFormer/RecurTrace), and Engram hard-bypass (AION).
+"""
 from __future__ import annotations
 
 import math
@@ -8,6 +11,13 @@ import torch.nn.functional as F
 
 from .sampler import resolve_sampling_mode
 from .creativity import novelty_reweight
+from .reliability import (
+    TokenReliabilityHead,
+    leftward_relaxation_mask,
+    select_remask_positions,
+)
+from .halting import HaltingPolicy
+from .episodic import EngramGate
 
 
 class DecoderLayer(nn.Module):
@@ -36,10 +46,6 @@ class AnyProcessDecoder(nn.Module):
         self.cfg = cfg
         self.emb = emb
         d = cfg.d_model
-        # Previously DecoderLayer's dropout defaulted to 0.0 and nothing
-        # overrode it, so the one built-in regularizer in the decoder was
-        # silently disabled -- nothing was pushing the model toward
-        # generalizing rather than memorizing exact training sequences.
         dropout = getattr(cfg, "decoder_dropout", 0.1)
         self.layers = nn.ModuleList(
             DecoderLayer(d, cfg.n_heads, dropout=dropout) for _ in range(cfg.n_dec_layers)
@@ -49,8 +55,11 @@ class AnyProcessDecoder(nn.Module):
         self.lm_head.weight = emb.weight
         self.insert_proj = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, 1))
         self.delete_proj = nn.Linear(d, 1)
+        self.reliability_head = TokenReliabilityHead(d) if getattr(cfg, "use_reliability_head", True) else None
+        self.halting_head = HaltingPolicy(d) if getattr(cfg, "use_halting", False) else None
+        self.engram_gate = EngramGate(d) if getattr(cfg, "use_engram_bypass", True) else None
 
-    def forward(self, prompt_hidden, y):
+    def forward(self, prompt_hidden, y, return_hidden: bool = False):
         if prompt_hidden.dim() == 2:
             prompt_hidden = prompt_hidden.unsqueeze(0)
         x = self.emb(y)
@@ -60,29 +69,15 @@ class AnyProcessDecoder(nn.Module):
         logits = self.lm_head(h)
         ins = F.softplus(self.insert_proj(h)).squeeze(-1)
         dele = self.delete_proj(h).squeeze(-1)
+        if return_hidden:
+            return logits, ins, dele, h
         return logits, ins, dele
 
     @torch.no_grad()
     def refine(self, prompt_hidden, length, steps=None, allow_insert=True,
                allow_delete=True, init_ids=None, verifier=None,
                logit_noise=0.0, seed=None, prompt_text=None, sample_mode=None,
-               backbone=None, novelty_lam=0.0):
-        """prompt_text / sample_mode: previously every commit/revise
-        decision in this loop used plain argmax over probs -- Sampler's
-        uniform/semantic_uniform modes existed in sampler.py but were
-        never called from here, so a prompt asking for "a random number"
-        still got the model's ordinary (dataset-frequency-biased) most
-        confident token every time; logit_noise only ever added Gaussian
-        noise before the same argmax, which is not actually sampling from
-        a calibrated distribution. sample_mode, or an auto-detected mode
-        from prompt_text via resolve_sampling_mode(), now controls how
-        the WINNING token at each committed/revised position is chosen:
-        'model' (default) keeps the previous argmax-of-probs behavior
-        unchanged for anyone not asking for randomness; 'uniform' picks
-        flat over the whole vocab; 'semantic_uniform' picks flat among
-        the top-k plausible candidates (stays on-topic, defeats frequency
-        bias) -- this is what prompts matching detect_randomness_request
-        route to automatically."""
+               backbone=None, novelty_lam=0.0, query_ids=None):
         cfg = self.cfg
         if prompt_hidden.dim() == 2:
             prompt_hidden = prompt_hidden.unsqueeze(0)
@@ -91,6 +86,27 @@ class AnyProcessDecoder(nn.Module):
         steps = steps or cfg.refine_steps
         gen = torch.Generator(device="cpu").manual_seed(0 if seed is None else seed)
         mode = resolve_sampling_mode(prompt_text, sample_mode)
+
+        # ---- Engram hard-bypass (AION): B==1 only (per-example decision) ----
+        if (B == 1 and self.engram_gate is not None and backbone is not None
+                and getattr(cfg, "use_engram_bypass", True) and query_ids is not None):
+            try:
+                q = query_ids[0] if query_ids.dim() > 1 else query_ids
+                address = backbone.address_score(q)
+                if address >= getattr(cfg, "engram_confidence_threshold", 0.90):
+                    hits = backbone.retrieve(q, topk=1)
+                    if hits:
+                        salient = hits[0]["gist"].get("salient") or []
+                        if salient:
+                            tokens = torch.tensor(
+                                [salient[i % len(salient)] for i in range(length)],
+                                device=dev, dtype=torch.long,
+                            ).unsqueeze(0)
+                            return {"tokens": tokens, "edits": [],
+                                    "verify_rounds": 0, "bypassed": True,
+                                    "address_score": address}
+            except Exception:
+                pass
 
         if init_ids is None:
             y = torch.full((B, length), cfg.mask_id, dtype=torch.long, device=dev)
@@ -101,52 +117,25 @@ class AnyProcessDecoder(nn.Module):
 
         edits = []
         for s in range(steps):
-            logits, ins, dele = self.forward(prompt_hidden, y)
+            logits, ins, dele, hidden = self.forward(prompt_hidden, y, return_hidden=True)
             if logit_noise > 0:
                 noise = torch.randn(logits.shape, generator=gen).to(dev)
                 logits = logits + logit_noise * noise
-            # MDLM SUBS: never predict the mask token
             logits = logits.clone()
             logits[..., cfg.mask_id] = -float("inf")
 
-            # creativity: push logits away from vocabulary entries whose
-            # embedding resembles anything already stored in gist memory.
-            # novelty_reweight (creativity.py) was fully implemented but
-            # had no real call site anywhere in the package -- generation
-            # never actually became more novel/creative, regardless of
-            # what was stored. Only applied when a backbone (for
-            # gist_proj + its GistMemory) is actually passed in and
-            # novelty_lam > 0, so default behavior (no backbone passed)
-            # is unchanged. Projects the token embedding matrix into
-            # gist_dim space via the SAME gist_proj the memory vectors
-            # were written with, so the two sides of the comparison are
-            # in the same space -- novelty_reweight raises loudly if they
-            # aren't, which was the dimensional bug (d_model=256 vs
-            # gist_dim=128) in the version nothing ever called.
             if backbone is not None and novelty_lam > 0:
                 mem_vecs = backbone.memory.all_vectors()
                 if mem_vecs:
                     mem_tensor = torch.stack(mem_vecs).to(dev)
                     emb_in_gist_space = backbone.gist_proj(self.emb.weight)
-                    logits = novelty_reweight(logits, emb_in_gist_space,
-                                              mem_tensor, lam=novelty_lam)
+                    logits = novelty_reweight(logits, emb_in_gist_space, mem_tensor, lam=novelty_lam)
 
             probs = F.softmax(logits, dim=-1)
             conf, amax = probs.max(-1)
 
-            # anti-bias sampling: replace the argmax winner at every
-            # position with a draw from the requested distribution. conf
-            # (used for commit ordering / revise-margin gating) stays the
-            # MODEL's own confidence either way -- only WHICH token wins
-            # at a position changes. This keeps "commit the positions
-            # the model is surest about first" intact while fixing WHAT
-            # gets written there.
             if mode == "uniform":
                 V = logits.shape[-1]
-                # one draw per POSITION, not per vocab entry -- drawing
-                # logits.shape ([B,T,V]) worth of randomness here would
-                # waste V-1/V of the draws and was simply wrong shape for
-                # "pick one random token per position".
                 u = torch.rand(logits.shape[:-1], generator=gen).to(dev)
                 amax = (u * V).long().clamp_max(V - 1)
                 amax = torch.where(amax == cfg.mask_id, (amax + 1) % V, amax)
@@ -155,14 +144,43 @@ class AnyProcessDecoder(nn.Module):
                 u = torch.rand(logits.shape, generator=gen).to(dev).clamp_min(1e-6)
                 gumbel = -torch.log(-torch.log(u))
                 perturbed = logits + 0.1 * gumbel
-                top_idx = torch.topk(perturbed, top_k, dim=-1).indices  # [B,T,k]
-                pick_pos = torch.randint(0, top_k, logits.shape[:-1],
-                                         generator=gen).to(dev)  # [B,T]
+                top_idx = torch.topk(perturbed, top_k, dim=-1).indices
+                pick_pos = torch.randint(0, top_k, logits.shape[:-1], generator=gen).to(dev)
                 amax = torch.gather(top_idx, -1, pick_pos.unsqueeze(-1)).squeeze(-1)
 
-            # revision of committed tokens
+            # token-level halting (soft freeze of confident committed positions)
+            if self.halting_head is not None and getattr(cfg, "use_halting", False):
+                try:
+                    halt_prob = torch.sigmoid(self.halting_head(hidden))
+                    newly_halted = committed & (halt_prob >= 0.5)
+                except Exception:
+                    newly_halted = torch.zeros_like(committed)
+            else:
+                newly_halted = torch.zeros_like(committed)
+
+            # PRISM reliability-guided remask of committed tokens
+            if self.reliability_head is not None and getattr(cfg, "use_reliability_head", True):
+                try:
+                    rel_prob = torch.sigmoid(self.reliability_head(hidden))
+                    remask = select_remask_positions(
+                        reliability=rel_prob,
+                        committed=committed & ~newly_halted,
+                        top_frac=getattr(cfg, "reliability_remask_top_frac", 0.25),
+                        window=getattr(cfg, "edit_leftward_relaxation", 3),
+                    )
+                    if remask.any():
+                        for b in range(B):
+                            for i in remask[b].nonzero().flatten().tolist():
+                                edits.append(("remask_rel", b, i, int(y[b, i]), None))
+                                y[b, i] = cfg.mask_id
+                                committed[b, i] = False
+                except Exception:
+                    pass
+
+            # revise committed tokens
             cur_p = probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
-            better = committed & (conf > cur_p + cfg.revise_margin) & (amax != y)
+            better = (committed & ~newly_halted
+                      & (conf > cur_p + cfg.revise_margin) & (amax != y))
             for b in range(B):
                 for i in better[b].nonzero().flatten().tolist():
                     edits.append(("edit", b, i, int(y[b, i]), int(amax[b, i])))
@@ -186,16 +204,7 @@ class AnyProcessDecoder(nn.Module):
                 y[b][pick] = amax[b][pick]
                 committed[b] |= pick
 
-            # insertion: build each row as a python list (length varies
-            # per example depending on how many slots that example wants
-            # inserted), then pad every row to the batch's new max length
-            # with fresh mask_id slots before restacking into a tensor.
-            # Previously rows were stacked back individually per-b without
-            # reconciling lengths across the batch -- with B>1 and
-            # per-example insertion counts differing, that produces
-            # ragged rows that cannot actually form a single tensor on
-            # the next loop iteration (a silent correctness bug that only
-            # surfaces once two rows in a batch insert different counts).
+            # insertion
             row_y_lists, row_c_lists = None, None
             if allow_insert and s < steps - 1:
                 t = (s + 1) / steps
@@ -215,17 +224,7 @@ class AnyProcessDecoder(nn.Module):
                     row_y_lists.append(y_list)
                     row_c_lists.append(c_list)
 
-            # deletion: a committed position is dropped if the model has
-            # low confidence in ANY token there (conf < delete_floor) AND
-            # the trained delete_proj head agrees (dele < 0). Previously
-            # del_mask was computed and never applied -- deletion was dead
-            # code despite allow_delete=True being the default and
-            # delete_proj being trained via the aux loss. Applied here,
-            # after insertion, against this step's own conf/dele (same
-            # pattern insertion already used against this step's ins),
-            # so neither edit operates on stale indices from a layout
-            # that's since shifted. At least one token per example is
-            # always kept so a row never collapses to empty.
+            # deletion
             if allow_delete and committed.any():
                 del_mask = committed & (conf < cfg.delete_floor) & (dele < 0)
                 if row_y_lists is None:
@@ -246,8 +245,6 @@ class AnyProcessDecoder(nn.Module):
                     row_y_lists[b] = [row_y_lists[b][j] for j in keep_idx]
                     row_c_lists[b] = [row_c_lists[b][j] for j in keep_idx]
 
-            # restack: pad every row to the batch max length with fresh
-            # mask_id slots so y/committed stay rectangular tensors.
             if row_y_lists is not None:
                 max_len = max(len(r) for r in row_y_lists)
                 new_y = torch.full((B, max_len), cfg.mask_id, dtype=torch.long, device=dev)
@@ -258,6 +255,7 @@ class AnyProcessDecoder(nn.Module):
                     new_c[b, :n] = torch.stack(row_c_lists[b])
                 y, committed = new_y, new_c
 
+        # verification loop with leftward relaxation
         v_rounds = 0
         if verifier is not None:
             for _ in range(3):
@@ -266,12 +264,19 @@ class AnyProcessDecoder(nn.Module):
                 if res.get("ok"):
                     break
                 bad = res.get("bad") or list(range(y.shape[1]))
+                bad_mask = torch.zeros(y.shape[1], dtype=torch.bool, device=dev)
                 for i in bad:
                     if i < y.shape[1]:
-                        y[0, i] = cfg.mask_id
-                        committed[0, i] = False
-                logits, _, _ = self.forward(prompt_hidden, y)
+                        bad_mask[i] = True
+                bad_mask = leftward_relaxation_mask(
+                    bad_mask.unsqueeze(0),
+                    window=getattr(cfg, "edit_leftward_relaxation", 3),
+                )[0]
+                for i in bad_mask.nonzero().flatten().tolist():
+                    y[0, i] = cfg.mask_id
+                    committed[0, i] = False
+                logits, _, _, _ = self.forward(prompt_hidden, y, return_hidden=True)
                 logits[..., cfg.mask_id] = -float("inf")
                 y[0, ~committed[0]] = logits[0, ~committed[0]].argmax(-1)
 
-        return {"tokens": y, "edits": edits, "verify_rounds": v_rounds}
+        return {"tokens": y, "edits": edits, "verify_rounds": v_rounds, "bypassed": False}

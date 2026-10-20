@@ -1,33 +1,11 @@
-"""Continual learning: the admission formula.
+"""Continual learning: admission formula + OASIS history sketch + readout
+monitor hookup.
 
-The single biggest lever on continual-learning quality is *what is allowed
-into capacity in the first place*.  Training on everything the user says
-degrades the model (bloat, frustration, thanks-only messages, duplicates,
-contradictions).
-
-Research basis
---------------
-* Learnability-aware data selection (arXiv 2510.15035): examples are scored
-  +1 if learnable-and-new (generalisation gain), 0 if learnable-but-
-  already-mastered (redundancy risk), -1 if unlearnable (stale/noisy/hard).
-  Unlearnable data drags validation *down*; mastered data invites memorisation.
-* SFT for knowledge / RL for generalisation: stable factual knowledge enters
-  slowly; behaviours are shaped by outcome reward.
-* Human memory anatomy: episodic (fast, disposable) -> semantic concept
-  store (consolidated, gated) -> slow structural change.
-
-NEMIX scores every interaction x:
-
-    A(x) = +w_n*novelty + w_l*learnability + w_u*utility
-           - w_r*redundancy - w_b*bloat - w_v*volatility
-
-  A >= theta_high : consolidate into the concept store (-> slow weights)
-  A >= theta_low  : keep in the episodic buffer (replay, may decay)
-  A <  theta_low  : DISCARD -- never trained on (the guard rail)
-
-Repeated, consistent, high-scoring observations of the same key are
-promoted episodic -> concept; capacity limits evict the *lowest-score*
-items first, so quality of the store is monotone -- it cannot bloat.
+Two changes vs the previous version:
+  * ContinualMemory maintains a HistorySketch (OASIS) of ALL admitted
+    vectors, so redundancy is estimated beyond the current store.
+  * set_theta_high() lets the readout monitor dynamically relax the
+    consolidation threshold when plasticity is at risk.
 """
 from __future__ import annotations
 
@@ -37,10 +15,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import torch
 
-# ----------------------------------------------------------------------
-# bloat / noise detectors
-# ----------------------------------------------------------------------
+from .plasticity import HistorySketch, ReadoutMonitor, adjust_theta_high
+
+
 FRUSTRATION_MARKERS = (
     "stupid", "idiot", "wtf", "ugh", "damn", "hate you", "useless",
     "trash", "garbage", "whatever", "idc", "fuck", "shit", "dumb",
@@ -57,45 +36,41 @@ _LAUGHTER_RE = re.compile(r"(ha){3,}|(lol)+|lmao|hehehe")
 
 
 def text_bloat(text: str) -> float:
-    """How much of this text is noise that should NOT enter capacity. [0,1]."""
     t = (text or "").strip().lower()
     if not t:
         return 1.0
     score = 0.0
-    core = t.strip(" .!?,;:")                     # punctuation-insensitive
+    core = t.strip(" .!?,;:")
     if core in THANKS_ONLY:
         return 1.0
     words = core.split()
     if words and all(w.strip(" .!?") in THANKS_ONLY for w in words):
-        return 1.0                                # "great! nice ok, thanks."
+        return 1.0
     if any(m in t for m in FRUSTRATION_MARKERS):
-        score += 0.50          # emotional noise: veto-level, never learned
+        score += 0.50
     if any(m in t for m in DEFLECTION_MARKERS):
-        score += 0.50          # refusal boilerplate: veto-level as well
+        score += 0.50
     if _REPEAT_RE.search(t) or _LAUGHTER_RE.search(t):
         score += 0.25
     if len(words) <= 2 and not any(ch.isdigit() for ch in t):
-        score += 0.35           # "ok cool" -- nothing to learn
+        score += 0.35
     if len(words) >= 3:
         if len(set(words)) / len(words) < 0.4:
-            score += 0.20       # repetitive filler
+            score += 0.20
     letters = [c for c in t if c.isalpha()]
     if len(letters) >= 6 and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7:
         score += 0.15
     return min(score, 1.0)
 
 
-# ----------------------------------------------------------------------
-# signals + formula
-# ----------------------------------------------------------------------
 @dataclass
 class AdmissionSignals:
-    novelty: float = 0.0        # 1 - max similarity to existing memory
-    learnability: float = 0.0   # normalised loss drop from training on it
-    utility: float = 0.0        # did it improve the outcome / user goal
-    redundancy: float = 0.0     # max similarity to *mastered* material
-    bloat: float = 0.0          # noise / frustration / boilerplate
-    volatility: float = 0.0     # conflicts with consolidated knowledge
+    novelty: float = 0.0
+    learnability: float = 0.0
+    utility: float = 0.0
+    redundancy: float = 0.0
+    bloat: float = 0.0
+    volatility: float = 0.0
 
 
 def admission_score(s: AdmissionSignals, cfg=None) -> float:
@@ -111,12 +86,10 @@ def admission_score(s: AdmissionSignals, cfg=None) -> float:
     )
 
 
-def admit(s: AdmissionSignals, cfg=None) -> str:
-    """-> 'consolidate' | 'episodic' | 'discard'"""
-    # hard rails: some things NEVER enter capacity, no matter how novel
+def admit(s: AdmissionSignals, cfg=None, theta_high: Optional[float] = None) -> str:
     if s.bloat >= 0.5 or s.volatility >= 0.5:
         return "discard"
-    th = getattr(cfg, "theta_high", 0.25)
+    th = theta_high if theta_high is not None else getattr(cfg, "theta_high", 0.25)
     tl = getattr(cfg, "theta_low", -0.05)
     a = admission_score(s, cfg)
     if a >= th:
@@ -126,13 +99,12 @@ def admit(s: AdmissionSignals, cfg=None) -> str:
     return "discard"
 
 
-# ----------------------------------------------------------------------
-# three-tier memory with gated capacity
-# ----------------------------------------------------------------------
 def _cos(a, b) -> float:
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(x * x for x in b)) or 1.0
-    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+    a = torch.as_tensor(a, dtype=torch.float32)
+    b = torch.as_tensor(b, dtype=torch.float32)
+    na = torch.linalg.norm(a) or 1.0
+    nb = torch.linalg.norm(b) or 1.0
+    return float(torch.dot(a, b) / (na * nb))
 
 
 @dataclass
@@ -145,8 +117,6 @@ class MemoryEntry:
 
 
 class ContinualMemory:
-    """episodic buffer (fast, disposable) + concept store (gated, slow)."""
-
     def __init__(self, cfg=None):
         self.cfg = cfg
         self.cap_e = getattr(cfg, "capacity_episodic", 64)
@@ -155,6 +125,28 @@ class ContinualMemory:
         self.episodic: list[MemoryEntry] = []
         self.concepts: list[MemoryEntry] = []
         self.log: list[dict] = []
+        dim = getattr(cfg, "gist_dim", 128) if cfg is not None else 128
+        self.history = HistorySketch(
+            dim=dim,
+            capacity=getattr(cfg, "admission_history_size", 512) if cfg else 512,
+        )
+        self._current_theta_high: Optional[float] = None
+        self.archive_hook = None
+        self.sparse_store = None
+
+    def set_archive_hook(self, hook) -> None:
+        self.archive_hook = hook
+
+    def set_sparse_store(self, store) -> None:
+        self.sparse_store = store
+
+    def set_theta_high(self, th: Optional[float]) -> None:
+        self._current_theta_high = th
+
+    def _effective_theta_high(self) -> float:
+        if self._current_theta_high is not None:
+            return self._current_theta_high
+        return getattr(self.cfg, "theta_high", 0.25)
 
     def _find(self, key: str) -> Optional[MemoryEntry]:
         for e in self.concepts:
@@ -171,7 +163,9 @@ class ContinualMemory:
             best = max(best, _cos(vector, e.vector))
         return best
 
-    # -- main entry -----------------------------------------------------
+    def history_similarity(self, vector) -> float:
+        return self.history.max_similarity(torch.as_tensor(vector, dtype=torch.float32))
+
     def observe(
         self,
         key: str,
@@ -180,21 +174,28 @@ class ContinualMemory:
         signals: Optional[AdmissionSignals] = None,
         text: Optional[str] = None,
     ) -> dict:
-        """Gate one interaction into capacity.  Returns the decision."""
         if signals is None:
             signals = AdmissionSignals()
         if text is not None:
             signals.bloat = max(signals.bloat, text_bloat(text))
 
         sim_concept = max((_cos(vector, e.vector) for e in self.concepts), default=0.0)
-        if signals.redundancy == 0.0 and sim_concept > 0.0:
-            signals.redundancy = sim_concept
+        sim_history = self.history_similarity(vector)
+        effective_redundancy = max(sim_concept, sim_history)
+        if signals.redundancy == 0.0:
+            signals.redundancy = effective_redundancy
         if signals.novelty == 0.0:
-            signals.novelty = 1.0 - max(sim_concept, self.max_similarity(vector))
+            signals.novelty = 1.0 - max(
+                sim_concept, self.max_similarity(vector), sim_history,
+            )
 
         a = admission_score(signals, self.cfg)
-        decision = admit(signals, self.cfg)
-        rec = {"key": key, "score": round(a, 4), "decision": decision}
+        th = self._effective_theta_high()
+        decision = admit(signals, self.cfg, theta_high=th)
+        rec = {
+            "key": key, "score": round(a, 4), "decision": decision,
+            "theta_high_used": round(th, 4),
+        }
         self.log.append(rec)
 
         if decision == "discard":
@@ -211,6 +212,24 @@ class ContinualMemory:
             self.episodic.append(entry)
             rec["action"] = "episodic"
 
+        try:
+            self.history.add(torch.as_tensor(vector, dtype=torch.float32).flatten())
+        except Exception:
+            pass
+        if self.archive_hook is not None:
+            try:
+                self.archive_hook(key, payload, vector, signals.novelty)
+            except Exception:
+                pass
+        if self.sparse_store is not None and isinstance(payload, str):
+            try:
+                self.sparse_store.maybe_write(
+                    token_ids=list(payload.encode("utf-8"))[:256],
+                    novelty=signals.novelty, salience=a, vector=None,
+                )
+            except Exception:
+                pass
+
         self._enforce_capacity()
         return rec
 
@@ -221,12 +240,10 @@ class ContinualMemory:
             self.concepts.append(entry)
 
     def _enforce_capacity(self) -> None:
+        th = self._effective_theta_high()
         for e in list(self.episodic):
-            if e.hits >= self.promote_hits and e.score >= getattr(
-                self.cfg, "theta_high", 0.25
-            ):
+            if e.hits >= self.promote_hits and e.score >= th:
                 self._promote(e)
-        # evict LOWEST score first -- quality-monotone capacity
         if len(self.episodic) > self.cap_e:
             self.episodic.sort(key=lambda e: e.score, reverse=True)
             self.episodic = self.episodic[: self.cap_e]
@@ -234,10 +251,7 @@ class ContinualMemory:
             self.concepts.sort(key=lambda e: e.score, reverse=True)
             self.concepts = self.concepts[: self.cap_c]
 
-    # -- training mix ----------------------------------------------------
     def replay(self, n: int, seed: int = 0) -> list:
-        """Score-weighted sample (with replacement) for consolidation
-        training -- higher A(x) => more replay, quality can only rise."""
         pool = self.concepts + self.episodic
         if not pool:
             return []
@@ -249,23 +263,12 @@ class ContinualMemory:
         return {
             "episodic": len(self.episodic),
             "concepts": len(self.concepts),
+            "history": len(self.history),
             "discarded": sum(1 for r in self.log if r["decision"] == "discard"),
             "accepted": sum(1 for r in self.log if r["decision"] != "discard"),
         }
 
 
-# ----------------------------------------------------------------------
-# online driver -- this is the integration point that was missing.
-# ContinualMemory + admit() were fully implemented and correct, but
-# nothing in the package ever called them: no part of train.py or
-# model.py constructed a ContinualMemory, called .observe() on a live
-# turn, or trained on .replay(). The admission formula existed and did
-# nothing. observe_turn() below is what a chat/serving loop calls once
-# per user turn, and consolidate_step() is what periodically trains the
-# backbone on the gated, score-weighted replay buffer -- the actual
-# "learn continuously but don't dump everything in" loop your original
-# requirement asked for.
-# ----------------------------------------------------------------------
 def observe_turn(
     memory: "ContinualMemory",
     model,
@@ -274,49 +277,30 @@ def observe_turn(
     tokenizer=None,
     utility: float = 0.0,
 ) -> dict:
-    """Gate one raw user/assistant turn into capacity.
-
-    key: a stable identifier for this fact/preference/topic so repeated
-    mentions accumulate hits toward promotion rather than each becoming a
-    separate episodic entry. If not given, falls back to a normalized
-    prefix of the text -- coarse, but keeps near-identical repeated
-    messages from each claiming a fresh slot.
-
-    tokenizer: anything exposing .encode(text) -> list[int]/tensor. If
-    omitted, novelty/redundancy signals degrade gracefully to 0 (the
-    bloat/frustration/thanks-only guard rail in text_bloat still runs
-    regardless, since that's pure text analysis and needs no model).
-
-    Returns the same decision dict ContinualMemory.observe() returns, so
-    callers can log or route on 'consolidate' / 'episodic' / 'discard'.
-    """
     if key is None:
         key = (text or "").strip().lower()[:80]
-
     vector = [0.0] * max(getattr(model, "cfg", None) and model.cfg.gist_dim or 8, 1)
     if tokenizer is not None and model is not None and hasattr(model, "backbone"):
         try:
-            import torch
             ids = tokenizer.encode(text)
             ids = torch.as_tensor(ids, dtype=torch.long)
             with torch.no_grad():
                 vector = model.backbone.gist_vector(ids).tolist()
         except Exception:
-            pass  # fall back to the zero vector; bloat/frustration gating still applies
-
+            pass
     signals = AdmissionSignals(utility=utility)
     return memory.observe(key, payload=text, vector=vector, signals=signals, text=text)
 
 
-def consolidate_step(memory: "ContinualMemory", model, opt, tokenizer,
-                     n_replay: int = 8, device: str = "cpu"):
-    """One small gradient step on the gated replay buffer. Call this
-    periodically (e.g. every N observe_turn calls, or on an idle timer)
-    rather than training on every single turn -- replay() already
-    score-weights which memories get trained on more, so capacity-gated
-    quality and training frequency are two independent knobs."""
-    import torch
-
+def consolidate_step(
+    memory: "ContinualMemory",
+    model,
+    opt,
+    tokenizer,
+    n_replay: int = 8,
+    device: str = "cpu",
+    edit_weight: float = 0.0,
+):
     batch = memory.replay(n_replay)
     if not batch or tokenizer is None:
         return None
@@ -330,7 +314,8 @@ def consolidate_step(memory: "ContinualMemory", model, opt, tokenizer,
         ids_t = torch.as_tensor(ids, dtype=torch.long, device=device)
         prompt_ids = ids_t[:1]
         target_ids = ids_t[1:]
-        out = model.loss(prompt_ids, target_ids, t_max=0.5)
+        out = model.loss(prompt_ids, target_ids, t_max=0.5,
+                         edit_weight=edit_weight)
         losses.append(out["loss"])
     if not losses:
         return None

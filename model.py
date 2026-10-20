@@ -1,15 +1,10 @@
-"""NEMIX-v2 full model: GDN backbone + recurrent depth + any-process decoder.
-
-Fixes vs previous version:
-  * loss() now implements the MDLM Rao-Blackwellized objective: t ~ U(0, t_max),
-    mask probability t, loss ONLY on masked positions, weighted by 1/alpha_t
-    clamped to elbo_max_weight.  This is the correct masked-diffusion objective;
-    the previous version computed CE on every position and used a fixed
-    [0.5, 1.0] mask ratio, which is why the loss bounced instead of decreasing.
-  * mask_id logit is set to -inf before CE (MDLM SUBS: zero masking probability).
-  * auxiliary insertion/deletion loss is gated by cfg.aux_weight (default 0.0).
+"""NEMIX-v3 full model: GDN backbone + recurrent depth + any-process decoder
++ edit-consistency loss + token-level halting + reliability head + randomness
+consistency + Engram hard-bypass.
 """
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -18,12 +13,19 @@ import torch.nn.functional as F
 from .backbone import NEMIXBackbone
 from .refinement import AnyProcessDecoder
 from .megas import MEGaBank
+from .halting import LoopMemoryAttention, HaltingPolicy
+from .reliability import leftward_relaxation_mask
+from .randomness import (
+    should_apply_randomness_loss,
+    extract_valid_strings,
+    strings_to_token_ids,
+    randomness_consistency_loss,
+)
 
 
 class RecurrentDepth(nn.Module):
-    """Weight-tied recurrent core.  With use_act=False (default at 20M) it
-    just runs max_loop_iters fixed passes with no halting head and no
-    ponder penalty."""
+    """Weight-tied recurrent core with optional RecurTrace-style loop memory
+    and per-token halting."""
 
     def __init__(self, cfg):
         super().__init__()
@@ -37,24 +39,30 @@ class RecurrentDepth(nn.Module):
             for _ in range(cfg.n_recurrent)
         )
         self.halt = nn.Linear(d, 1)
+        use_loop_mem = getattr(cfg, "halting_use_loop_memory", True)
+        self.loop_memory = LoopMemoryAttention(d, n_heads=cfg.n_heads) if use_loop_mem else None
+        self.halting_head = HaltingPolicy(d) if getattr(cfg, "use_halting", False) else None
 
-    def forward(self, x):
+    def forward(self, x, return_all_loops: bool = False):
         cfg = self.cfg
         B, L, _ = x.shape
         cumulative = torch.zeros(B, L, device=x.device)
         halted = torch.zeros(B, L, dtype=torch.bool, device=x.device)
         ponder = x.new_zeros(())
-        # Same dead-flag issue as NEMIXBackbone.stream: use_gradient_checkpointing
-        # was never read here either, despite this being the module that
-        # re-runs its blocks max_loop_iters times -- the single deepest,
-        # most activation-memory-hungry part of the forward graph.
         use_ckpt = (getattr(cfg, "use_gradient_checkpointing", False)
-                   and self.training and torch.is_grad_enabled())
+                    and self.training and torch.is_grad_enabled())
         if use_ckpt:
             from torch.utils.checkpoint import checkpoint
+        past_hidden: list[torch.Tensor] = []
+        all_hidden: list[torch.Tensor] = []
         for _ in range(cfg.max_loop_iters):
             for layer in self.blocks:
                 x = checkpoint(layer, x, use_reentrant=False) if use_ckpt else layer(x)
+            if self.loop_memory is not None and past_hidden:
+                x = self.loop_memory(x, past_hidden)
+            past_hidden.append(x)
+            if return_all_loops:
+                all_hidden.append(x)
             if cfg.use_act:
                 p = torch.sigmoid(self.halt(x)).squeeze(-1)
                 still = ~halted
@@ -66,13 +74,16 @@ class RecurrentDepth(nn.Module):
                     break
         if cfg.use_act:
             ponder = cfg.act_penalty_weight * ponder / (B * L)
+        if return_all_loops:
+            return x, ponder, all_hidden
         return x, ponder
 
 
 class NEMIXModel(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, tokenizer=None):
         super().__init__()
         self.cfg = cfg
+        self.tokenizer = tokenizer
         self.backbone = NEMIXBackbone(cfg)
         self.prelude = nn.TransformerEncoderLayer(
             d_model=cfg.d_model, nhead=cfg.n_heads,
@@ -95,24 +106,26 @@ class NEMIXModel(nn.Module):
         h = self.coda(h)
         return h, ponder
 
-    # ------------------------------------------------------------------
-    # MDLM Rao-Blackwellized loss
-    # ------------------------------------------------------------------
+    def _edit_weight(self, step: Optional[int] = None) -> float:
+        cfg = self.cfg
+        w0 = getattr(cfg, "edit_weight_start", 0.0)
+        w1 = getattr(cfg, "edit_weight_final", 0.5)
+        warmup = getattr(cfg, "edit_weight_warmup_steps", 1000)
+        if warmup <= 0 or step is None:
+            return w1
+        frac = min(1.0, step / warmup)
+        return w0 + (w1 - w0) * frac
+
     def loss(self, prompt_ids, target_ids, t_max: float = 1.0,
-              elbo_max_weight: float | None = None):
-        """t ~ U(0, t_max); alpha_t = 1 - t; mask probability = t.
-        Loss only on masked positions, weighted by 1/alpha_t clamped to
-        elbo_max_weight (defaults to cfg.elbo_max_weight if not given).
-        t_max is the mask-ratio curriculum upper bound: start at ~0.15 and
-        anneal to 1.0.  elbo_max_weight should be annealed on its OWN,
-        slower schedule (see train._elbo_weight_curriculum) -- if it is
-        already at its final value by the time t_max reaches 1.0, the
-        model gets hit with both its hardest masking ratios and its
-        heaviest per-token loss weight at the same step, which collapses
-        training to predicting the single highest-frequency token
-        everywhere."""
+             elbo_max_weight: Optional[float] = None,
+             edit_weight: Optional[float] = None,
+             step: Optional[int] = None,
+             prompt_text: Optional[str] = None,
+             return_dict: bool = True):
         if elbo_max_weight is None:
             elbo_max_weight = self.cfg.elbo_max_weight
+        if edit_weight is None:
+            edit_weight = self._edit_weight(step)
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
             target_ids = target_ids.unsqueeze(0)
@@ -121,25 +134,20 @@ class NEMIXModel(nn.Module):
 
         prompt_hidden, ponder = self._encode_prompt(prompt_ids)
 
-        # ---- forward noising process (MDLM) ---------------------------
-        t = torch.rand(B, device=dev) * float(t_max)          # [B]
-        mask_prob = t                                          # alpha=1-t, mask=1-alpha=t
+        t = torch.rand(B, device=dev) * float(t_max)
+        mask_prob = t
         rand = torch.rand((B, T), device=dev)
         masked = rand < mask_prob.unsqueeze(1)
-
         pad_mask = target_ids == self.cfg.pad_id
         masked = masked & ~pad_mask
-        # ensure at least one masked token per example (unless all PAD)
         for b in range(B):
             if (not masked[b].any()) and (~pad_mask[b]).any():
                 first_valid = (~pad_mask[b]).nonzero(as_tuple=False)[0, 0]
                 masked[b, first_valid] = True
-
         corrupted = target_ids.clone()
         corrupted[masked] = self.cfg.mask_id
 
-        logits, ins, dele = self.decoder(prompt_hidden, corrupted)
-        # MDLM SUBS: zero probability on the mask token itself
+        logits, ins, dele, hidden = self.decoder(prompt_hidden, corrupted, return_hidden=True)
         logits = logits.clone()
         logits[..., self.cfg.mask_id] = -float("inf")
 
@@ -149,14 +157,71 @@ class NEMIXModel(nn.Module):
             reduction="none",
         ).reshape(B, T)
 
-        # ---- Rao-Blackwellized weight 1/alpha_t, clamped ---------------
-        alpha = (1.0 - t).clamp_min(1.0 / elbo_max_weight)  # [B]
-        weight = (1.0 / alpha).unsqueeze(1)                 # [B, 1]
-
+        alpha = (1.0 - t).clamp_min(1.0 / elbo_max_weight)
+        weight = (1.0 / alpha).unsqueeze(1)
         denom = masked.float().sum().clamp_min(1.0)
         nll = (ce * masked.float() * weight).sum() / denom
-
         loss = nll + ponder.to(nll.device)
+
+        # ---- edit-consistency loss (PURE/T2M training-time) ----
+        edit_loss_val = torch.tensor(0.0, device=dev)
+        if edit_weight > 0:
+            draft = logits.argmax(-1)
+            wrong = (draft != target_ids) & masked & ~pad_mask
+            if wrong.any():
+                wrong_relaxed = leftward_relaxation_mask(
+                    wrong,
+                    window=getattr(self.cfg, "edit_leftward_relaxation", 3),
+                ) & ~pad_mask
+                corrupted2 = draft.clone()
+                corrupted2[wrong_relaxed] = self.cfg.mask_id
+                logits2, _, _, _ = self.decoder(prompt_hidden, corrupted2, return_hidden=True)
+                logits2 = logits2.clone()
+                logits2[..., self.cfg.mask_id] = -float("inf")
+                ce2 = F.cross_entropy(
+                    logits2.reshape(-1, self.cfg.vocab_size),
+                    target_ids.reshape(-1),
+                    reduction="none",
+                ).reshape(B, T)
+                edit_loss_val = (
+                    ce2 * wrong_relaxed.float()
+                ).sum() / wrong_relaxed.float().sum().clamp_min(1.0)
+                loss = loss + edit_weight * edit_loss_val
+
+        # ---- reliability head loss (PRISM) ----
+        rel_loss_val = torch.tensor(0.0, device=dev)
+        if (self.decoder.reliability_head is not None
+                and getattr(self.cfg, "use_reliability_head", True)
+                and getattr(self.cfg, "reliability_head_weight", 0.1) > 0):
+            with torch.no_grad():
+                target_rel = ((logits.argmax(-1) != target_ids) & ~pad_mask).float()
+            rel_logit = self.decoder.reliability_head(hidden)
+            rel_loss = F.binary_cross_entropy_with_logits(rel_logit, target_rel)
+            loss = loss + getattr(self.cfg, "reliability_head_weight", 0.1) * rel_loss
+            rel_loss_val = rel_loss.detach()
+
+        # ---- randomness-consistency loss ----
+        rand_loss_val = torch.tensor(0.0, device=dev)
+        if (prompt_text is not None
+                and getattr(self.cfg, "randomness_consistency_weight", 0.05) > 0
+                and self.tokenizer is not None
+                and should_apply_randomness_loss(prompt_text)):
+            try:
+                strings = extract_valid_strings(prompt_text)
+                valid_ids = strings_to_token_ids(strings, self.tokenizer)
+                if valid_ids:
+                    first_pos = (~pad_mask).float().argmax(dim=1)
+                    per_ex = []
+                    for b in range(B):
+                        p = int(first_pos[b].item())
+                        per_ex.append(randomness_consistency_loss(logits[b, p], valid_ids, weight=1.0))
+                    if per_ex:
+                        rand_loss = torch.stack(per_ex).mean()
+                        w = getattr(self.cfg, "randomness_consistency_weight", 0.05)
+                        loss = loss + w * rand_loss
+                        rand_loss_val = rand_loss.detach()
+            except Exception:
+                pass
 
         if self.cfg.aux_weight > 0:
             aux = self.cfg.aux_weight * (
@@ -166,28 +231,27 @@ class NEMIXModel(nn.Module):
             loss = loss + aux
 
         acc = (logits.argmax(-1) == target_ids).float().mean()
-        return {"loss": loss, "acc": acc.item(), "nll": nll.item(),
-                "mask_frac": masked.float().mean().item()}
+        out = {
+            "loss": loss,
+            "acc": acc.item(),
+            "nll": nll.item(),
+            "mask_frac": masked.float().mean().item(),
+            "edit_loss": float(edit_loss_val.item()),
+            "rel_loss": float(rel_loss_val.item()),
+            "rand_loss": float(rand_loss_val.item()),
+        }
+        return out if return_dict else out["loss"]
 
     def generate(self, prompt_ids, out_len, prompt_text=None,
                 novelty_lam=0.0, **kwargs):
-        """prompt_text: the original prompt string, if available, so the
-        decoder can auto-detect a 'give me a random X' request and switch
-        off argmax-only token selection for it (see refinement.refine's
-        sample_mode docs). Passing None preserves the previous behavior
-        exactly -- this is purely additive.
-
-        novelty_lam: >0 enables novelty-reweighted generation against
-        this model's own gist memory (self.backbone.memory), pushing
-        output away from content already stored there. 0.0 (default)
-        keeps generation unchanged from before -- this only activates
-        when explicitly requested, since memory contents depend entirely
-        on what stream() has written so far in this session."""
         squeeze = prompt_ids.dim() == 1
         prompt_hidden, _ = self._encode_prompt(prompt_ids)
-        res = self.decoder.refine(prompt_hidden, out_len, prompt_text=prompt_text,
-                                  backbone=self.backbone if novelty_lam > 0 else None,
-                                  novelty_lam=novelty_lam, **kwargs)
+        res = self.decoder.refine(
+            prompt_hidden, out_len, prompt_text=prompt_text,
+            backbone=self.backbone, novelty_lam=novelty_lam,
+            query_ids=prompt_ids,
+            **kwargs,
+        )
         if squeeze:
             res["tokens"] = res["tokens"][0]
         return res

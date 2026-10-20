@@ -1,18 +1,5 @@
-"""NEMIX-v2 backbone: Gated DeltaNet + gist memory sidecar.
-
-Fixes vs the previous version on disk:
-  * GatedDeltaNet.forward returns (hidden, attn_weights, past_kv), not a
-    bare tensor.  Unpack defensively so the same GDNBlock also works with
-    the nn.TransformerEncoderLayer fallback (which returns a tensor).
-  * nn.Embedding's default N(0, 1) init produces logits of std ~sqrt(d)
-    and an initial cross-entropy ~200 when the embedding is weight-tied
-    to the LM head.  Force std=0.02 so the initial loss is ~log(V).
-  * Assert every reserved special token id is < vocab_size at
-    construction time.  Without this, a mismatch (e.g. mask_id=32256
-    with vocab_size=32256) crashed the CUDA gather inside nn.Embedding
-    after 5 minutes of training with a device-side assert, which is
-    impossible to debug from the traceback.  This check fails
-    immediately with a clear Python message instead.
+"""NEMIX-v3 backbone: Gated DeltaNet + gist memory + sparse episodic store
++ hippocampal exact KV cache + optional hybrid full-attention layers.
 """
 from __future__ import annotations
 
@@ -23,89 +10,96 @@ import torch
 import torch.nn as nn
 
 from .memory import GistMemory
+from .episodic import SparseEpisodicStore
 
 try:
     from fla.layers import GatedDeltaNet
 except ImportError:
     GatedDeltaNet = None
 
-# If fla is missing, GDNBlock silently falls back to a standard quadratic
-# nn.TransformerEncoderLayer -- which defeats the entire point of this
-# architecture (no KV-cache growth, O(1) recurrent state per token). A
-# model trained on the fallback is NOT testing Gated DeltaNet at all, and
-# nothing about its loss curve or output would reveal that. Default
-# behavior is now to raise loudly at backbone construction time; set
-# NEMIX_ALLOW_ATTENTION_FALLBACK=1 only for deliberate CPU-only debugging
-# where the fla Triton kernels genuinely cannot be installed, and even
-# then every constructed GDNBlock prints a visible warning so it can
-# never be silently mistaken for the real mixer in a training log.
 _ALLOW_FALLBACK = os.environ.get("NEMIX_ALLOW_ATTENTION_FALLBACK", "0") == "1"
 
 
 def _unpack_mixer_output(out):
-    """fla's GatedDeltaNet returns (hidden, attn_weights, past_kv) or similar.
-    Return only the hidden tensor; pass tensors through unchanged."""
     if isinstance(out, tuple):
         return out[0]
     return out
 
 
-class GDNBlock(nn.Module):
-    """Gated DeltaNet mixer + SwiGLU FFN."""
+class HippocampusCache:
+    """Fixed-size LRU exact KV cache for short-range recall."""
 
-    def __init__(self, cfg):
+    def __init__(self, size: int = 0):
+        self.size = size
+        self.k: list[torch.Tensor] = []
+        self.v: list[torch.Tensor] = []
+
+    def enabled(self) -> bool:
+        return self.size > 0
+
+    def write(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        if not self.enabled():
+            return
+        B, T, d = k.shape
+        for b in range(B):
+            for t in range(T):
+                self.k.append(k[b, t].detach().clone())
+                self.v.append(v[b, t].detach().clone())
+        while len(self.k) > self.size:
+            self.k.pop(0)
+            self.v.pop(0)
+
+    def retrieve(self, q: torch.Tensor, topk: int = 4):
+        if not self.enabled() or not self.k:
+            return None, None
+        K = torch.stack(self.k)
+        V = torch.stack(self.v)
+        scores = torch.nn.functional.normalize(K, dim=-1) @ \
+                 torch.nn.functional.normalize(q.flatten(), dim=0)
+        idx = torch.topk(scores, min(topk, scores.numel())).indices
+        return K[idx], V[idx]
+
+
+class GDNBlock(nn.Module):
+    def __init__(self, cfg, use_full_attention: bool = False):
         super().__init__()
         self.norm1 = nn.RMSNorm(cfg.d_model)
         self.is_fallback_attention = False
-        if GatedDeltaNet is not None:
+        self.is_full_attention = use_full_attention
+        if use_full_attention:
+            self.mixer = nn.TransformerEncoderLayer(
+                d_model=cfg.d_model, nhead=cfg.n_heads,
+                dim_feedforward=4 * cfg.d_model,
+                batch_first=True, norm_first=True,
+            )
+        elif GatedDeltaNet is not None:
             try:
                 self.mixer = GatedDeltaNet(
-                    hidden_size=cfg.d_model,
-                    num_heads=cfg.n_heads,
-                    mode="chunk",
-                    expand_v=cfg.expand_v,
-                    use_gate=cfg.use_gate,
-                    chunk_size=cfg.chunk_size,
+                    hidden_size=cfg.d_model, num_heads=cfg.n_heads,
+                    mode="chunk", expand_v=cfg.expand_v,
+                    use_gate=cfg.use_gate, chunk_size=cfg.chunk_size,
                 )
             except TypeError:
-                # older fla versions do not accept chunk_size
                 self.mixer = GatedDeltaNet(
-                    hidden_size=cfg.d_model,
-                    num_heads=cfg.n_heads,
-                    mode="chunk",
-                    expand_v=cfg.expand_v,
+                    hidden_size=cfg.d_model, num_heads=cfg.n_heads,
+                    mode="chunk", expand_v=cfg.expand_v,
                     use_gate=cfg.use_gate,
                 )
         else:
             if not _ALLOW_FALLBACK:
                 raise ImportError(
-                    "flash-linear-attention (fla) is not installed, so "
-                    "GatedDeltaNet is unavailable. NEMIX's whole value "
-                    "proposition vs a standard transformer is O(1) "
-                    "recurrent state instead of a growing KV cache -- "
-                    "silently substituting nn.TransformerEncoderLayer "
-                    "here would mean every subsequent benchmark against "
-                    "a GPT baseline is comparing two attention "
-                    "transformers, not testing this architecture. "
-                    "Install fla (`pip install flash-linear-attention`) "
-                    "or, for deliberate CPU-only debugging only, set "
-                    "NEMIX_ALLOW_ATTENTION_FALLBACK=1 to proceed anyway."
+                    "flash-linear-attention not installed. Install it or set "
+                    "NEMIX_ALLOW_ATTENTION_FALLBACK=1 for deliberate debugging."
                 )
             warnings.warn(
-                "NEMIX_ALLOW_ATTENTION_FALLBACK=1: GDNBlock is using a "
-                "standard quadratic nn.TransformerEncoderLayer, NOT "
-                "GatedDeltaNet. KV-cache growth and quadratic compute "
-                "are back. Any run using this fallback is not a valid "
-                "test of the NEMIX architecture.",
-                RuntimeWarning,
-                stacklevel=2,
+                "NEMIX_ALLOW_ATTENTION_FALLBACK=1: quadratic attention. "
+                "Not a valid test of NEMIX.",
+                RuntimeWarning, stacklevel=2,
             )
             self.mixer = nn.TransformerEncoderLayer(
-                d_model=cfg.d_model,
-                nhead=cfg.n_heads,
+                d_model=cfg.d_model, nhead=cfg.n_heads,
                 dim_feedforward=4 * cfg.d_model,
-                batch_first=True,
-                norm_first=True,
+                batch_first=True, norm_first=True,
             )
             self.is_fallback_attention = True
         self.norm2 = nn.RMSNorm(cfg.d_model)
@@ -125,24 +119,21 @@ class GDNBlock(nn.Module):
 class NEMIXBackbone(nn.Module):
     def __init__(self, cfg, unigram_log_probs=None):
         super().__init__()
-
-        # ---- vocab sanity check: catch special-token/vocab collisions --
         for name, sid in [("mask", cfg.mask_id), ("pad", cfg.pad_id),
                           ("bos", cfg.bos_id), ("eos", cfg.eos_id)]:
             assert sid < cfg.vocab_size, (
-                f"{name}_id {sid} >= vocab_size {cfg.vocab_size}. "
-                f"Special token ids must be reserved slots past the "
-                f"tokenizer range, and vocab_size must be > max of them."
+                f"{name}_id {sid} >= vocab_size {cfg.vocab_size}."
             )
-
         self.cfg = cfg
         self.emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        # Weight tying means this matrix is also the LM head.  Default
-        # N(0, 1) init gives std ~sqrt(d) logits and an initial loss ~200.
-        # std=0.02 puts the initial loss at ~log(vocab_size) ≈ 10.4.
         nn.init.normal_(self.emb.weight, std=0.02)
 
-        self.layers = nn.ModuleList(GDNBlock(cfg) for _ in range(cfg.n_layers))
+        every = int(getattr(cfg, "hybrid_attention_every", 0))
+        layers = []
+        for i in range(cfg.n_layers):
+            use_full = every > 0 and i > 0 and (i % every == 0)
+            layers.append(GDNBlock(cfg, use_full_attention=use_full))
+        self.layers = nn.ModuleList(layers)
         self.norm_f = nn.RMSNorm(cfg.d_model)
 
         self.gist_proj = nn.Linear(cfg.d_model, cfg.gist_dim, bias=False)
@@ -154,6 +145,15 @@ class NEMIXBackbone(nn.Module):
             write_threshold=cfg.gist_write_threshold,
             max_salient=cfg.max_salient_tokens,
         )
+        self.sparse_store = SparseEpisodicStore(
+            capacity=getattr(cfg, "sparse_store_capacity", 4096),
+            path=getattr(cfg, "sparse_store_path", ""),
+            min_novelty=getattr(cfg, "sparse_min_novelty", 0.30),
+        )
+        self.hippocampus = HippocampusCache(
+            size=getattr(cfg, "hippocampus_size", 0)
+        )
+
         if unigram_log_probs is None:
             unigram_log_probs = torch.full(
                 (cfg.vocab_size,),
@@ -167,16 +167,6 @@ class NEMIXBackbone(nn.Module):
             ids = ids.unsqueeze(0)
         B, T = ids.shape
         x = self.emb(ids)
-        # cfg.use_gradient_checkpointing was declared in NEMIXConfig and
-        # never referenced anywhere -- a dead flag that did nothing
-        # regardless of its value. torch.utils.checkpoint trades extra
-        # compute (each checkpointed layer's forward runs twice: once
-        # during the forward pass, discarded, and once again during
-        # backward to recompute activations) for not storing per-layer
-        # activations, which is the actual lever for fitting longer
-        # sequences / bigger batches in limited GPU memory. Only engages
-        # under grad (training); during no_grad inference (generate/
-        # refine) it would recompute for nothing, so it's skipped there.
         use_ckpt = getattr(self.cfg, "use_gradient_checkpointing", False)
         if use_ckpt and self.training and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
@@ -187,6 +177,9 @@ class NEMIXBackbone(nn.Module):
                 x = layer(x)
         h = self.norm_f(x)
 
+        if self.hippocampus.enabled():
+            self.hippocampus.write(h, h)
+
         n_written = 0
         if write and self.memory is not None:
             step = self.cfg.gist_block_tokens
@@ -194,8 +187,18 @@ class NEMIXBackbone(nn.Module):
                 for i in range(0, T, step):
                     chunk = ids[b, i:i + step]
                     vec = self.gist_vector(chunk)
-                    if self.memory.write(vec, salient=self.salient_ids(chunk), pos=i):
+                    wrote, novelty = self.memory.write(
+                        vec, salient=self.salient_ids(chunk), pos=i,
+                        n_tokens=len(chunk),
+                    )
+                    if wrote:
                         n_written += 1
+                        self.sparse_store.maybe_write(
+                            token_ids=chunk.tolist(),
+                            novelty=novelty,
+                            salience=float(-self.unigram_log_probs[chunk].mean().item()),
+                            vector=vec,
+                        )
         return {"hidden": h.squeeze(0) if squeeze else h, "n_written": n_written}
 
     def gist_vector(self, ids):
@@ -214,15 +217,38 @@ class NEMIXBackbone(nn.Module):
     def retrieve(self, query_ids, topk=5):
         return self.memory.retrieve(self.gist_vector(query_ids), topk=topk)
 
+    def retrieve_sparse(self, query_ids, topk=None):
+        if topk is None:
+            topk = getattr(self.cfg, "sparse_replay_topk", 3)
+        return self.sparse_store.retrieve(self.gist_vector(query_ids), topk=topk)
+
+    def retrieve_exact(self, query_hidden, topk=4):
+        return self.hippocampus.retrieve(query_hidden, topk=topk)
+
+    def address_score(self, query_ids) -> float:
+        hits = self.retrieve(query_ids, topk=1)
+        if not hits:
+            return 0.0
+        return float(hits[0].get("norm_score", hits[0]["score"]))
+
+    def stream_chunked(self, ids, chunk_size: int = 2048, write: bool = True):
+        squeeze = ids.dim() == 1
+        if squeeze:
+            ids = ids.unsqueeze(0)
+        T = ids.shape[1]
+        last = None
+        for start in range(0, T, chunk_size):
+            chunk = ids[:, start:start + chunk_size]
+            last = self.stream(chunk, write=write)
+        return last if last is not None else {"hidden": None, "n_written": 0}
+
     def memory_nbytes(self):
         return self.memory.nbytes()
 
     def mixer_kind(self) -> str:
-        """Report which mixer is actually running, so training logs never
-        leave this ambiguous. 'gated_deltanet' is the real architecture;
-        'quadratic_attention_fallback' means fla was unavailable and the
-        NEMIX_ALLOW_ATTENTION_FALLBACK escape hatch was used -- any run
-        reporting this is not a valid test of the architecture."""
         if any(getattr(layer, "is_fallback_attention", False) for layer in self.layers):
             return "quadratic_attention_fallback"
+        n_full = sum(1 for layer in self.layers if getattr(layer, "is_full_attention", False))
+        if n_full > 0:
+            return f"hybrid_gdn_{len(self.layers) - n_full}_full_{n_full}"
         return "gated_deltanet"

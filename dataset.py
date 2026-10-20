@@ -1,11 +1,16 @@
-"""Curate a high-quality Python dataset for NEMIX-v2."""
+"""Curate a high-quality Python dataset for NEMIX-v3.
+
+Changes:
+  * Truncation is opt-in (max_prompt_len / max_target_len = 0 means no truncation).
+  * prompt_text is stored alongside ids so randomness-consistency and
+    admission can route on it during training.
+  * pack_for_training() exposes the packing helper for a future collate.
+"""
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
-from typing import Iterable
 
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
@@ -33,18 +38,18 @@ def _execute(code, tests, timeout=5):
 
 
 def _from_mbpp(ex):
-    """MBPP schema: task_id, text, code, test_list, test_setup_code, ..."""
     text = ex.get("text", "")
     code = ex.get("code", "")
     if not text or not code:
         return None
-    prompt = f"# {text.strip()}\n"
-    target = code.strip() + "\n"
-    return {"prompt": prompt, "target": target, "tests": ex.get("test_list", [])}
+    return {
+        "prompt": f"# {text.strip()}\n",
+        "target": code.strip() + "\n",
+        "tests": ex.get("test_list", []),
+    }
 
 
 def _from_opencodeinstruct(ex, verify: bool):
-    """Defensive getter; field names vary across versions."""
     if ex.get("language") != "python":
         return None
     prob = _safe_get(ex, "problem", "input", "prompt")
@@ -64,7 +69,9 @@ def _from_opencodeinstruct(ex, verify: bool):
 def build_dataset(tokenizer_path: str,
                   opencode_limit: int = 200_000,
                   verify: bool = True,
-                  out_path: str = "python_train.jsonl"):
+                  out_path: str = "python_train.jsonl",
+                  max_prompt_len: int = 0,
+                  max_target_len: int = 0):
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -90,17 +97,31 @@ def build_dataset(tokenizer_path: str,
         print(f"OpenCodeInstruct: {added} added")
 
     def encode(rec):
-        prompt_ids = tok(rec["prompt"], truncation=True, max_length=256).input_ids
-        target_ids = tok(rec["target"], truncation=True, max_length=512).input_ids
-        return {"prompt_ids": prompt_ids, "target_ids": target_ids}
+        prompt_ids = tok(
+            rec["prompt"], truncation=(max_prompt_len > 0),
+            max_length=max_prompt_len if max_prompt_len > 0 else None,
+        ).input_ids
+        target_ids = tok(
+            rec["target"], truncation=(max_target_len > 0),
+            max_length=max_target_len if max_target_len > 0 else None,
+        ).input_ids
+        return {
+            "prompt_ids": prompt_ids,
+            "target_ids": target_ids,
+            "prompt_text": rec["prompt"],
+        }
 
-    ds = Dataset.from_list(records).map(encode, remove_columns=list(records[0].keys()),
-                                         keep_in_memory=True)
+    ds = Dataset.from_list(records).map(
+        encode,
+        remove_columns=list(records[0].keys()),
+        keep_in_memory=True,
+    )
     with open(out_path, "w") as f:
         for i in range(len(ds)):
             f.write(json.dumps({
                 "prompt_ids": ds[i]["prompt_ids"],
                 "target_ids": ds[i]["target_ids"],
+                "prompt_text": ds[i]["prompt_text"],
             }) + "\n")
     print(f"wrote {len(ds)} examples to {out_path}")
     return out_path
@@ -112,13 +133,6 @@ def load_training_pairs(path: str):
 
 
 def split_train_val(pairs: list, val_frac: float = 0.02, seed: int = 0):
-    """Hold out a validation slice. Nothing in the package previously
-    split data at all -- train_any had no way to measure generalization
-    during training, only to run full eval.py (HumanEval/MBPP pass@k)
-    after the fact, which is slow and only tells you at the very end.
-    A deterministic shuffle + slice is enough to catch memorization
-    (growing train/val loss gap) far earlier, cheaply, every eval_every
-    steps during training."""
     import random
     idx = list(range(len(pairs)))
     random.Random(seed).shuffle(idx)
@@ -127,3 +141,10 @@ def split_train_val(pairs: list, val_frac: float = 0.02, seed: int = 0):
     train = [pairs[i] for i in idx if i not in val_idx]
     val = [pairs[i] for i in idx if i in val_idx]
     return train, val
+
+
+def pack_for_training(pairs: list, max_len: int = 2048):
+    """Pack pairs into blocks with `segments` metadata; build a block-diag
+    mask via packing.make_block_diag_attention_mask(segments) in your collate."""
+    from .packing import pack_pairs
+    return pack_pairs(pairs, max_len=max_len)
