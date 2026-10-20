@@ -1,6 +1,14 @@
 """NEMIX-v3 full model: GDN backbone + recurrent depth + any-process decoder
 + edit-consistency loss + token-level halting + reliability head + randomness
 consistency + Engram hard-bypass.
+
+New in this revision:
+  * `ingest_context(ids)` explicitly populates gist memory, sparse store,
+    and hippocampal cache. Nothing else writes to memory, so without a
+    call to ingest_context the memory system is empty and Engram bypass /
+    sparse replay / novelty reweighting all silently no-op. Call it once
+    per new conversation / document before generate().
+  * Halting in refinement.refine is now gated by cfg.halting_oracle_trained.
 """
 from __future__ import annotations
 
@@ -24,9 +32,6 @@ from .randomness import (
 
 
 class RecurrentDepth(nn.Module):
-    """Weight-tied recurrent core with optional RecurTrace-style loop memory
-    and per-token halting."""
-
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -41,6 +46,10 @@ class RecurrentDepth(nn.Module):
         self.halt = nn.Linear(d, 1)
         use_loop_mem = getattr(cfg, "halting_use_loop_memory", True)
         self.loop_memory = LoopMemoryAttention(d, n_heads=cfg.n_heads) if use_loop_mem else None
+        # NOTE: this halting_head is constructed but only trained once the
+        # oracle wiring in model.loss is added. It is intentionally NOT
+        # called in forward() below -- the RecurrentDepth-level halting
+        # signal comes from self.halt (ACT), not from HaltingPolicy.
         self.halting_head = HaltingPolicy(d) if getattr(cfg, "use_halting", False) else None
 
     def forward(self, x, return_all_loops: bool = False):
@@ -97,14 +106,27 @@ class NEMIXModel(nn.Module):
         self.decoder = AnyProcessDecoder(cfg, self.backbone.emb)
         self.mega = MEGaBank(cfg)
 
-    def _encode_prompt(self, prompt_ids):
+    def _encode_prompt(self, prompt_ids, write_memory: bool = False):
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
-        h = self.backbone.stream(prompt_ids, write=False)["hidden"]
+        h = self.backbone.stream(prompt_ids, write=write_memory)["hidden"]
         h = self.prelude(h)
         h, ponder = self.rdt(h)
         h = self.coda(h)
         return h, ponder
+
+    @torch.no_grad()
+    def ingest_context(self, prompt_ids):
+        """Populate gist memory / sparse store / hippocampal cache with a
+        new context. Call this once per conversation or document before
+        generate(). Without this call, Engram bypass, sparse replay, and
+        novelty reweighting are all no-ops because the memory is empty."""
+        if prompt_ids.dim() == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        out = self.backbone.stream(prompt_ids, write=True)
+        return {"n_written": out["n_written"],
+                "memory_stats": self.backbone.memory.stats(),
+                "sparse_entries": len(self.backbone.sparse_store)}
 
     def _edit_weight(self, step: Optional[int] = None) -> float:
         cfg = self.cfg
@@ -163,7 +185,6 @@ class NEMIXModel(nn.Module):
         nll = (ce * masked.float() * weight).sum() / denom
         loss = nll + ponder.to(nll.device)
 
-        # ---- edit-consistency loss (PURE/T2M training-time) ----
         edit_loss_val = torch.tensor(0.0, device=dev)
         if edit_weight > 0:
             draft = logits.argmax(-1)
@@ -188,7 +209,6 @@ class NEMIXModel(nn.Module):
                 ).sum() / wrong_relaxed.float().sum().clamp_min(1.0)
                 loss = loss + edit_weight * edit_loss_val
 
-        # ---- reliability head loss (PRISM) ----
         rel_loss_val = torch.tensor(0.0, device=dev)
         if (self.decoder.reliability_head is not None
                 and getattr(self.cfg, "use_reliability_head", True)
@@ -200,7 +220,6 @@ class NEMIXModel(nn.Module):
             loss = loss + getattr(self.cfg, "reliability_head_weight", 0.1) * rel_loss
             rel_loss_val = rel_loss.detach()
 
-        # ---- randomness-consistency loss ----
         rand_loss_val = torch.tensor(0.0, device=dev)
         if (prompt_text is not None
                 and getattr(self.cfg, "randomness_consistency_weight", 0.05) > 0

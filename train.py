@@ -1,14 +1,20 @@
 """Training: NEMIX-v3 and a same-size GPT baseline.
 
-New:
-  * admission-gated training (ContinualMemory.observe per batch, discarded
-    examples are dropped from the loss)
-  * readout plasticity monitor (adjusts theta_high, partial reset)
-  * randomness-consistency routing via prompt_text -> model.loss
-  * consolidate_step integration on the gated replay buffer
+Fixes vs previous version:
+  * _admission_gate_batch now keys entries by a content hash of the prompt
+    ids instead of str(b). Previously every batch's example-0 shared the key
+    "0", so each batch silently refreshed the previous batch's memory slot
+    -- admission never accumulated more than batch_size entries and never
+    promoted anything meaningful.
+  * _get_prompt_texts gives per-example text, so admission's bloat detector
+    and consolidate_step see the right example, not always example 0.
+  * Halting warning is emitted once at train start if use_halting=True but
+    halting_oracle_trained=False, so it is obvious the halting path is
+    disabled by the safety guard.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from contextlib import nullcontext
 
@@ -124,19 +130,49 @@ def _edit_weight_curriculum(step, cfg):
     return w0 + (w1 - w0) * frac
 
 
-def _get_prompt_text(batch, tokenizer):
+def _get_prompt_texts(batch, tokenizer, n_examples: int):
+    """Return one text string per example (or None if unavailable)."""
     if "prompt_text" in batch:
         pt = batch["prompt_text"]
-        return pt[0] if isinstance(pt, (list, tuple)) else pt
+        if isinstance(pt, str):
+            return [pt] * n_examples
+        if isinstance(pt, (list, tuple)):
+            texts = list(pt)
+            while len(texts) < n_examples:
+                texts.append(texts[-1] if texts else "")
+            return texts[:n_examples]
     if tokenizer is None:
         return None
     try:
         ids = batch["prompt_ids"]
-        if ids.dim() > 1:
-            ids = ids[0]
-        return tokenizer.decode(ids.tolist())
+        if not isinstance(ids, torch.Tensor):
+            ids = torch.tensor(ids)
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        return [tokenizer.decode(ids[b].tolist()) for b in range(ids.shape[0])]
     except Exception:
         return None
+
+
+def _get_prompt_text(batch, tokenizer):
+    """First example's text, for randomness-loss which is per-batch."""
+    texts = _get_prompt_texts(batch, tokenizer, 1)
+    return texts[0] if texts else None
+
+
+def _prompt_hash_key(prompt_ids_1d: torch.Tensor) -> str:
+    """Stable, content-addressed key: same prompt ids -> same key; different
+    content -> different key. Replaces the previous str(b), which made every
+    batch's example-0 collide with the previous batch's example-0."""
+    try:
+        arr = prompt_ids_1d.detach().to("cpu", dtype=torch.int64).numpy().tobytes()
+        return hashlib.blake2b(arr, digest_size=8).hexdigest()
+    except Exception:
+        # Fallback: key on token id values.
+        return hashlib.blake2b(
+            str(prompt_ids_1d.detach().tolist()).encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
 
 
 def _gist_vectors(model, prompt_ids):
@@ -185,27 +221,32 @@ def evaluate_loss(model, val_dataloader, cfg, is_nemix, device, dtype, max_batch
     return {"raw": total_raw / n, "weighted": total_w / n}
 
 
-def _admission_gate_batch(model, memory, batch, tokenizer, device, utility=0.0):
+def _admission_gate_batch(model, memory, prompt_ids, texts, device):
+    """Return a bool mask [B] of examples that pass admission.
+
+    Each example is keyed by a content hash of its prompt ids, so refresh
+    only happens for genuinely identical prompts, and repeated distinct
+    prompts accumulate hits independently. Previously key=str(b) collapsed
+    every example-0 across every batch into one slot.
+    """
     if memory is None or not getattr(model, "cfg", None):
         return None
     try:
-        prompt_ids = batch["prompt_ids"].to(device)
+        B = prompt_ids.shape[0]
         vecs = _gist_vectors(model, prompt_ids)
         if vecs is None:
             return None
         keep = []
-        for b, v in enumerate(vecs):
-            text = None
-            if tokenizer is not None:
-                try:
-                    text = tokenizer.decode(prompt_ids[b].tolist())
-                except Exception:
-                    text = None
-            signals = AdmissionSignals(utility=utility)
+        for b in range(B):
+            key = _prompt_hash_key(prompt_ids[b])
+            text = texts[b] if (texts is not None and b < len(texts)) else None
+            signals = AdmissionSignals(utility=0.0)
             rec = memory.observe(
-                str(b),
-                payload=prompt_ids[b].detach().cpu().tolist(),
-                vector=v, signals=signals, text=text,
+                key,
+                payload=prompt_ids[b].detach().cpu().tolist(),  # list[int]
+                vector=vecs[b],
+                signals=signals,
+                text=text,
             )
             keep.append(rec["decision"] != "discard")
         return torch.tensor(keep, dtype=torch.bool, device=device)
@@ -230,6 +271,14 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
             print("WARNING: not using Gated DeltaNet -- results are not a valid test.",
                   flush=True)
 
+    # Warn once if halting was requested without the oracle-trained guard.
+    if is_nemix and getattr(cfg, "use_halting", False) and not getattr(cfg, "halting_oracle_trained", False):
+        print("WARNING: use_halting=True but halting_oracle_trained=False. "
+              "refinement.refine() will skip halting entirely until the oracle "
+              "training in halting.compute_oracle_halting_targets is wired into "
+              "model.loss and halting_oracle_trained is set to True.",
+              flush=True)
+
     if cfg.use_compile and hasattr(torch, "compile") and device == "cuda":
         model = torch.compile(model, mode="max-autotune")
 
@@ -242,8 +291,6 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
     readout_monitor = None
     if is_nemix and enable_admission:
         memory = ContinualMemory(cfg)
-        if hasattr(model, "backbone") and hasattr(model.backbone, "sparse_store"):
-            memory.set_sparse_store(model.backbone.sparse_store)
         print(f"Admission enabled (history cap {memory.history.capacity})", flush=True)
     if is_nemix and enable_plasticity_monitor:
         readout_monitor = ReadoutMonitor(
@@ -252,7 +299,6 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
         )
         print("Plasticity monitor enabled", flush=True)
 
-    # Token usage counter for partial_reset
     vocab_usage = torch.zeros(cfg.vocab_size, device=device)
 
     step = 0
@@ -268,10 +314,10 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
             if is_nemix:
                 p = _to_device(batch["prompt_ids"], device)
                 t = _to_device(batch["target_ids"], device)
-                admitted_mask = None
                 if memory is not None:
+                    texts = _get_prompt_texts(batch, tokenizer, p.shape[0])
                     admitted_mask = _admission_gate_batch(
-                        model, memory, batch, tokenizer, device,
+                        model, memory, p, texts, device,
                     )
                     if admitted_mask is not None and admitted_mask.numel() == p.shape[0]:
                         if not admitted_mask.all():
@@ -348,7 +394,6 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
                         print(f"  [plasticity] monitor failed: {e}", flush=True)
 
                 if (memory is not None
-                        and tokenizer is not None
                         and step % consolidate_every == 0):
                     try:
                         cl = consolidate_step(

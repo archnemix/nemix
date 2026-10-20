@@ -177,7 +177,7 @@ class NEMIXBackbone(nn.Module):
                 x = layer(x)
         h = self.norm_f(x)
 
-        if self.hippocampus.enabled():
+        if write and self.hippocampus.enabled():
             self.hippocampus.write(h, h)
 
         n_written = 0

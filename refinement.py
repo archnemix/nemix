@@ -1,6 +1,14 @@
 """NEMIX-v3 any-process decoder: remask + insert + delete, plus
 reliability-guided remasking (PRISM), leftward relaxation (PURE/T2M),
 token-level halting (MoR/LoopFormer/RecurTrace), and Engram hard-bypass (AION).
+
+Fix vs previous version:
+  * `steps or cfg.refine_steps` silently overrode steps=0. Now `steps is None`.
+  * Halting is only applied if cfg.halting_oracle_trained is True. Until then
+    the head is skipped entirely (a randomly-initialized linear head at
+    sigmoid ~= 0.5 would otherwise freeze ~half of committed tokens at
+    random). Set halting_oracle_trained=True only after wiring the oracle
+    loss from halting.compute_oracle_halting_targets into model.loss.
 """
 from __future__ import annotations
 
@@ -83,11 +91,12 @@ class AnyProcessDecoder(nn.Module):
             prompt_hidden = prompt_hidden.unsqueeze(0)
         B = prompt_hidden.shape[0]
         dev = prompt_hidden.device
-        steps = steps or cfg.refine_steps
+        if steps is None:
+            steps = cfg.refine_steps
         gen = torch.Generator(device="cpu").manual_seed(0 if seed is None else seed)
         mode = resolve_sampling_mode(prompt_text, sample_mode)
 
-        # ---- Engram hard-bypass (AION): B==1 only (per-example decision) ----
+        # ---- Engram hard-bypass (AION): B==1 only ----
         if (B == 1 and self.engram_gate is not None and backbone is not None
                 and getattr(cfg, "use_engram_bypass", True) and query_ids is not None):
             try:
@@ -114,6 +123,15 @@ class AnyProcessDecoder(nn.Module):
         else:
             y = init_ids.view(B, -1).clone().to(dev)
             committed = y != cfg.mask_id
+
+        # Halting is only active once the oracle has actually trained the head.
+        # Otherwise a random-init linear head would freeze ~half of committed
+        # tokens at sigmoid ~= 0.5 -- strictly worse than no halting at all.
+        halting_active = (
+            self.halting_head is not None
+            and getattr(cfg, "use_halting", False)
+            and getattr(cfg, "halting_oracle_trained", False)
+        )
 
         edits = []
         for s in range(steps):
@@ -148,8 +166,8 @@ class AnyProcessDecoder(nn.Module):
                 pick_pos = torch.randint(0, top_k, logits.shape[:-1], generator=gen).to(dev)
                 amax = torch.gather(top_idx, -1, pick_pos.unsqueeze(-1)).squeeze(-1)
 
-            # token-level halting (soft freeze of confident committed positions)
-            if self.halting_head is not None and getattr(cfg, "use_halting", False):
+            # token-level halting (guarded)
+            if halting_active:
                 try:
                     halt_prob = torch.sigmoid(self.halting_head(hidden))
                     newly_halted = committed & (halt_prob >= 0.5)
@@ -177,7 +195,6 @@ class AnyProcessDecoder(nn.Module):
                 except Exception:
                     pass
 
-            # revise committed tokens
             cur_p = probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
             better = (committed & ~newly_halted
                       & (conf > cur_p + cfg.revise_margin) & (amax != y))
@@ -186,7 +203,6 @@ class AnyProcessDecoder(nn.Module):
                     edits.append(("edit", b, i, int(y[b, i]), int(amax[b, i])))
                     y[b, i] = amax[b, i]
 
-            # commit most confident masked positions
             remaining = ~committed
             for b in range(B):
                 if not remaining[b].any():
@@ -204,7 +220,6 @@ class AnyProcessDecoder(nn.Module):
                 y[b][pick] = amax[b][pick]
                 committed[b] |= pick
 
-            # insertion
             row_y_lists, row_c_lists = None, None
             if allow_insert and s < steps - 1:
                 t = (s + 1) / steps
@@ -224,7 +239,6 @@ class AnyProcessDecoder(nn.Module):
                     row_y_lists.append(y_list)
                     row_c_lists.append(c_list)
 
-            # deletion
             if allow_delete and committed.any():
                 del_mask = committed & (conf < cfg.delete_floor) & (dele < 0)
                 if row_y_lists is None:
@@ -255,7 +269,6 @@ class AnyProcessDecoder(nn.Module):
                     new_c[b, :n] = torch.stack(row_c_lists[b])
                 y, committed = new_y, new_c
 
-        # verification loop with leftward relaxation
         v_rounds = 0
         if verifier is not None:
             for _ in range(3):

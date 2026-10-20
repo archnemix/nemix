@@ -1,15 +1,21 @@
 """Continual learning: admission formula + OASIS history sketch + readout
 monitor hookup.
 
-Two changes vs the previous version:
-  * ContinualMemory maintains a HistorySketch (OASIS) of ALL admitted
-    vectors, so redundancy is estimated beyond the current store.
-  * set_theta_high() lets the readout monitor dynamically relax the
-    consolidation threshold when plasticity is at risk.
+Fixes applied in this revision:
+  * consolidate_step() accepts payloads stored as list[int] (token ids),
+    which is what train._admission_gate_batch actually stores. Previously it
+    always did str(payload) then tokenizer.encode(...), which tokenized the
+    literal characters '[', '1', '5', ',' ... and trained on garbage.
+  * ContinualMemory.observe() no longer tries to write to SparseEpisodicStore.
+    That branch was writing utf-8 BYTES as if they were token ids, and passed
+    vector=None so entries were permanently unretrievable. The sparse store is
+    now populated only by backbone.stream(write=True), which uses real chunk
+    tokens and a real gist vector.
+  * _cos() uses .item() instead of the fragile `torch.linalg.norm(a) or 1.0`
+    pattern.
 """
 from __future__ import annotations
 
-import math
 import random
 import re
 from dataclasses import dataclass
@@ -17,7 +23,7 @@ from typing import Any, Optional
 
 import torch
 
-from .plasticity import HistorySketch, ReadoutMonitor, adjust_theta_high
+from .plasticity import HistorySketch
 
 
 FRUSTRATION_MARKERS = (
@@ -102,9 +108,9 @@ def admit(s: AdmissionSignals, cfg=None, theta_high: Optional[float] = None) -> 
 def _cos(a, b) -> float:
     a = torch.as_tensor(a, dtype=torch.float32)
     b = torch.as_tensor(b, dtype=torch.float32)
-    na = torch.linalg.norm(a) or 1.0
-    nb = torch.linalg.norm(b) or 1.0
-    return float(torch.dot(a, b) / (na * nb))
+    na = float(torch.linalg.norm(a).item()) or 1.0
+    nb = float(torch.linalg.norm(b).item()) or 1.0
+    return float(torch.dot(a, b).item() / (na * nb))
 
 
 @dataclass
@@ -132,13 +138,9 @@ class ContinualMemory:
         )
         self._current_theta_high: Optional[float] = None
         self.archive_hook = None
-        self.sparse_store = None
 
     def set_archive_hook(self, hook) -> None:
         self.archive_hook = hook
-
-    def set_sparse_store(self, store) -> None:
-        self.sparse_store = store
 
     def set_theta_high(self, th: Optional[float]) -> None:
         self._current_theta_high = th
@@ -221,14 +223,6 @@ class ContinualMemory:
                 self.archive_hook(key, payload, vector, signals.novelty)
             except Exception:
                 pass
-        if self.sparse_store is not None and isinstance(payload, str):
-            try:
-                self.sparse_store.maybe_write(
-                    token_ids=list(payload.encode("utf-8"))[:256],
-                    novelty=signals.novelty, salience=a, vector=None,
-                )
-            except Exception:
-                pass
 
         self._enforce_capacity()
         return rec
@@ -292,6 +286,31 @@ def observe_turn(
     return memory.observe(key, payload=text, vector=vector, signals=signals, text=text)
 
 
+def _payload_to_ids(payload, tokenizer, device) -> Optional[torch.Tensor]:
+    """Normalize a MemoryEntry.payload into a long tensor of token ids.
+
+    Accepts:
+      * list[int] / tuple[int]: treated as token ids directly.
+      * torch.Tensor 1-D of ints: treated as token ids directly.
+      * str: encoded via the tokenizer.
+    Returns None if the payload cannot be turned into >= 2 token ids.
+    """
+    if isinstance(payload, torch.Tensor):
+        t = payload.detach().flatten().to(dtype=torch.long)
+    elif isinstance(payload, (list, tuple)) and payload and isinstance(payload[0], int):
+        t = torch.as_tensor(list(payload), dtype=torch.long)
+    elif isinstance(payload, str):
+        if tokenizer is None:
+            return None
+        ids = tokenizer.encode(payload)
+        t = torch.as_tensor(ids, dtype=torch.long)
+    else:
+        return None
+    if t.numel() < 2:
+        return None
+    return t.to(device)
+
+
 def consolidate_step(
     memory: "ContinualMemory",
     model,
@@ -301,17 +320,21 @@ def consolidate_step(
     device: str = "cpu",
     edit_weight: float = 0.0,
 ):
+    """One small gradient step on the gated replay buffer.
+
+    Trains on whatever payload the entry was stored with:
+      * list[int] token ids (the form train._admission_gate_batch stores)
+      * str, encoded via the tokenizer
+    """
     batch = memory.replay(n_replay)
-    if not batch or tokenizer is None:
+    if not batch:
         return None
     losses = []
     model.train()
     for entry in batch:
-        text = entry.payload if isinstance(entry.payload, str) else str(entry.payload)
-        ids = tokenizer.encode(text)
-        if len(ids) < 2:
+        ids_t = _payload_to_ids(entry.payload, tokenizer, device)
+        if ids_t is None:
             continue
-        ids_t = torch.as_tensor(ids, dtype=torch.long, device=device)
         prompt_ids = ids_t[:1]
         target_ids = ids_t[1:]
         out = model.loss(prompt_ids, target_ids, t_max=0.5,

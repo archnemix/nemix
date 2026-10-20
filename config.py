@@ -20,9 +20,7 @@ class NEMIXConfig:
     use_gate: bool = True
 
     # ---- hybrid attention (GDN-2 style) -----------------------------
-    # Insert one full-attention layer every N GDN blocks (0 = pure GDN).
     hybrid_attention_every: int = 0
-    # Fixed-size LRU exact KV cache alongside the recurrent state.
     hippocampus_size: int = 0
 
     # ---- recurrent depth --------------------------------------------
@@ -36,6 +34,12 @@ class NEMIXConfig:
 
     # ---- token-level halting (MoR / LoopFormer / RecurTrace) --------
     use_halting: bool = False
+    # SAFETY GUARD: halting head is only applied at inference if this is True.
+    # Flip this only after the oracle training in compute_oracle_halting_targets
+    # is wired into model.loss and the head has actually been trained. Until
+    # then, refinement.refine() silently skips halting even if use_halting=True,
+    # so a random-init head can no longer freeze ~50% of tokens.
+    halting_oracle_trained: bool = False
     halting_oracle_loops: int = 4
     halting_use_loop_memory: bool = True
     halting_compute_penalty: float = 1e-3
@@ -145,5 +149,5 @@ class NEMIXConfig:
     # ---- packing / variable length ---------------------------------
     use_packing: bool = True
     packing_max_len: int = 2048
-    dataset_max_prompt_len: int = 0   # 0 = no truncation
-    dataset_max_target_len: int = 0   # 0 = no truncation
+    dataset_max_prompt_len: int = 0
+    dataset_max_target_len: int = 0

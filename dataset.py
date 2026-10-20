@@ -1,10 +1,10 @@
 """Curate a high-quality Python dataset for NEMIX-v3.
 
-Changes:
-  * Truncation is opt-in (max_prompt_len / max_target_len = 0 means no truncation).
-  * prompt_text is stored alongside ids so randomness-consistency and
-    admission can route on it during training.
-  * pack_for_training() exposes the packing helper for a future collate.
+Changes in this revision:
+  * build_dataset raises a clear error if no records were collected
+    (offline / dataset rename / empty filters), instead of crashing on
+    records[0].keys().
+  * Everything else unchanged.
 """
 from __future__ import annotations
 
@@ -96,6 +96,13 @@ def build_dataset(tokenizer_path: str,
                 break
         print(f"OpenCodeInstruct: {added} added")
 
+    if not records:
+        raise RuntimeError(
+            "build_dataset collected 0 records. This usually means the "
+            "datasets library is offline, or a dataset name/split has "
+            "changed. Check load_dataset(...) calls above."
+        )
+
     def encode(rec):
         prompt_ids = tok(
             rec["prompt"], truncation=(max_prompt_len > 0),
@@ -144,7 +151,5 @@ def split_train_val(pairs: list, val_frac: float = 0.02, seed: int = 0):
 
 
 def pack_for_training(pairs: list, max_len: int = 2048):
-    """Pack pairs into blocks with `segments` metadata; build a block-diag
-    mask via packing.make_block_diag_attention_mask(segments) in your collate."""
     from .packing import pack_pairs
     return pack_pairs(pairs, max_len=max_len)
