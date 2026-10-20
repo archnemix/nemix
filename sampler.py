@@ -1,10 +1,58 @@
 """Sampling: provably unbiased selection.  Inverse transform for uniform
 modes; temperature calibration for entropy modes.  Both function API and a
-backward-compatible ``Sampler`` class."""
+backward-compatible ``Sampler`` class.
+
+detect_randomness_request() + resolve_sampling_mode() close a gap that
+previously existed between the uniform/semantic_uniform modes (which were
+implemented correctly) and actually using them: nothing in model.generate()
+or refinement.refine() ever passed mode="uniform", so a prompt literally
+asking for "a random number" still went through the model's ordinary
+logit distribution -- which is exactly the dataset-frequency bias the
+original requirement was about. The two helpers below let a caller route
+on the PROMPT TEXT automatically instead of requiring every call site to
+remember to ask for uniform sampling by hand."""
 from __future__ import annotations
+
+import re
 
 import torch
 import torch.nn.functional as F
+
+_RANDOMNESS_RE = re.compile(
+    r"\b(random(ly)?|pick\s+(one|any)|choose\s+(one|any)|"
+    r"roll\s+a\s+die|coin\s+flip|arbitrar(y|ily))\b",
+    re.IGNORECASE,
+)
+
+
+def detect_randomness_request(prompt_text: str) -> bool:
+    """Heuristic, text-level detector for 'give me a random X' style
+    requests. Deliberately conservative (keyword/phrase based, not a
+    learned classifier) so it's auditable and fails safe: false negatives
+    just mean ordinary model-distribution sampling is used (today's
+    status quo), false positives mean a request gets uniform sampling it
+    didn't strictly need, which is a much smaller cost than silently
+    staying biased on a request that explicitly asked not to be."""
+    if not prompt_text:
+        return False
+    return bool(_RANDOMNESS_RE.search(prompt_text))
+
+
+def resolve_sampling_mode(prompt_text: str, requested_mode: str | None = None) -> str:
+    """What mode model.generate() should actually use. An explicit
+    requested_mode always wins (never override a caller's deliberate
+    choice); otherwise auto-detect a randomness request from the prompt
+    text and switch to semantic_uniform (stays within plausible/on-topic
+    candidates via top-k, but picks among them with flat probability
+    instead of the model's learned, dataset-frequency-biased weights) --
+    a better default than fully flat 'uniform' over the whole vocabulary,
+    which would ignore the prompt's topic/type entirely (e.g. return
+    token garbage instead of a plausible-looking number or color)."""
+    if requested_mode is not None:
+        return requested_mode
+    if detect_randomness_request(prompt_text):
+        return "semantic_uniform"
+    return "model"
 
 
 def compute_entropy(probs):

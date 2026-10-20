@@ -12,10 +12,12 @@ from .verifier import (arithmetic_verifier, confidence_verifier,
 from .creativity import (novelty_reweight, entropy_calibrated_sample,
                           recombine, divergence_ratio)
 from .admission import (AdmissionSignals, ContinualMemory, admit,
-                         admission_score, text_bloat)
+                         admission_score, text_bloat,
+                         observe_turn, consolidate_step)
 from .deliberation import deliberate
-from .dataset import build_dataset, load_training_pairs
-from .train import (train_any, build_gpt_baseline, resolve_device, resolve_dtype)
+from .dataset import build_dataset, load_training_pairs, split_train_val
+from .train import (train_any, build_gpt_baseline, resolve_device, resolve_dtype,
+                    evaluate_loss)
 
 __all__ = [
     "NEMIXConfig", "NEMIXModel", "NEMIXBackbone", "GDNBlock",
@@ -24,6 +26,8 @@ __all__ = [
     "arithmetic_verifier", "confidence_verifier", "code_execution_verifier",
     "pick_best", "novelty_reweight", "entropy_calibrated_sample", "recombine",
     "divergence_ratio", "admit", "admission_score", "text_bloat",
-    "deliberate", "build_dataset", "load_training_pairs",
+    "observe_turn", "consolidate_step",
+    "deliberate", "build_dataset", "load_training_pairs", "split_train_val",
     "train_any", "build_gpt_baseline", "resolve_device", "resolve_dtype",
+    "evaluate_loss",
 ]

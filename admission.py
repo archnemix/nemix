@@ -252,3 +252,91 @@ class ContinualMemory:
             "discarded": sum(1 for r in self.log if r["decision"] == "discard"),
             "accepted": sum(1 for r in self.log if r["decision"] != "discard"),
         }
+
+
+# ----------------------------------------------------------------------
+# online driver -- this is the integration point that was missing.
+# ContinualMemory + admit() were fully implemented and correct, but
+# nothing in the package ever called them: no part of train.py or
+# model.py constructed a ContinualMemory, called .observe() on a live
+# turn, or trained on .replay(). The admission formula existed and did
+# nothing. observe_turn() below is what a chat/serving loop calls once
+# per user turn, and consolidate_step() is what periodically trains the
+# backbone on the gated, score-weighted replay buffer -- the actual
+# "learn continuously but don't dump everything in" loop your original
+# requirement asked for.
+# ----------------------------------------------------------------------
+def observe_turn(
+    memory: "ContinualMemory",
+    model,
+    text: str,
+    key: Optional[str] = None,
+    tokenizer=None,
+    utility: float = 0.0,
+) -> dict:
+    """Gate one raw user/assistant turn into capacity.
+
+    key: a stable identifier for this fact/preference/topic so repeated
+    mentions accumulate hits toward promotion rather than each becoming a
+    separate episodic entry. If not given, falls back to a normalized
+    prefix of the text -- coarse, but keeps near-identical repeated
+    messages from each claiming a fresh slot.
+
+    tokenizer: anything exposing .encode(text) -> list[int]/tensor. If
+    omitted, novelty/redundancy signals degrade gracefully to 0 (the
+    bloat/frustration/thanks-only guard rail in text_bloat still runs
+    regardless, since that's pure text analysis and needs no model).
+
+    Returns the same decision dict ContinualMemory.observe() returns, so
+    callers can log or route on 'consolidate' / 'episodic' / 'discard'.
+    """
+    if key is None:
+        key = (text or "").strip().lower()[:80]
+
+    vector = [0.0] * max(getattr(model, "cfg", None) and model.cfg.gist_dim or 8, 1)
+    if tokenizer is not None and model is not None and hasattr(model, "backbone"):
+        try:
+            import torch
+            ids = tokenizer.encode(text)
+            ids = torch.as_tensor(ids, dtype=torch.long)
+            with torch.no_grad():
+                vector = model.backbone.gist_vector(ids).tolist()
+        except Exception:
+            pass  # fall back to the zero vector; bloat/frustration gating still applies
+
+    signals = AdmissionSignals(utility=utility)
+    return memory.observe(key, payload=text, vector=vector, signals=signals, text=text)
+
+
+def consolidate_step(memory: "ContinualMemory", model, opt, tokenizer,
+                     n_replay: int = 8, device: str = "cpu"):
+    """One small gradient step on the gated replay buffer. Call this
+    periodically (e.g. every N observe_turn calls, or on an idle timer)
+    rather than training on every single turn -- replay() already
+    score-weights which memories get trained on more, so capacity-gated
+    quality and training frequency are two independent knobs."""
+    import torch
+
+    batch = memory.replay(n_replay)
+    if not batch or tokenizer is None:
+        return None
+    losses = []
+    model.train()
+    for entry in batch:
+        text = entry.payload if isinstance(entry.payload, str) else str(entry.payload)
+        ids = tokenizer.encode(text)
+        if len(ids) < 2:
+            continue
+        ids_t = torch.as_tensor(ids, dtype=torch.long, device=device)
+        prompt_ids = ids_t[:1]
+        target_ids = ids_t[1:]
+        out = model.loss(prompt_ids, target_ids, t_max=0.5)
+        losses.append(out["loss"])
+    if not losses:
+        return None
+    loss = torch.stack(losses).mean()
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    return float(loss.item())

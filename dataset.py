@@ -109,3 +109,21 @@ def build_dataset(tokenizer_path: str,
 def load_training_pairs(path: str):
     with open(path) as f:
         return [json.loads(line) for line in f]
+
+
+def split_train_val(pairs: list, val_frac: float = 0.02, seed: int = 0):
+    """Hold out a validation slice. Nothing in the package previously
+    split data at all -- train_any had no way to measure generalization
+    during training, only to run full eval.py (HumanEval/MBPP pass@k)
+    after the fact, which is slow and only tells you at the very end.
+    A deterministic shuffle + slice is enough to catch memorization
+    (growing train/val loss gap) far earlier, cheaply, every eval_every
+    steps during training."""
+    import random
+    idx = list(range(len(pairs)))
+    random.Random(seed).shuffle(idx)
+    n_val = max(1, int(len(pairs) * val_frac))
+    val_idx = set(idx[:n_val])
+    train = [pairs[i] for i in idx if i not in val_idx]
+    val = [pairs[i] for i in idx if i in val_idx]
+    return train, val

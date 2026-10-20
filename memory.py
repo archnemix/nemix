@@ -153,3 +153,10 @@ class GistMemory:
         vecs = sum(g["vec"].numel() for _, _, g in self._iter())
         sals = sum(len(g["salient"]) for _, _, g in self._iter())
         return vecs * 4 + sals * 8
+
+    def all_vectors(self) -> list:
+        """Public accessor for every stored gist vector, across all
+        levels. Added so external callers (e.g. refinement.refine's
+        novelty-reweighting path) don't need to reach into the
+        underscore-prefixed _iter() internal."""
+        return [g["vec"] for _, _, g in self._iter()]

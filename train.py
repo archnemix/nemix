@@ -84,11 +84,86 @@ def _t_max_curriculum(step, cfg):
     return cfg.mask_warmup_start + (1.0 - cfg.mask_warmup_start) * frac
 
 
+def _elbo_weight_curriculum(step, cfg):
+    """SUBS loss-weight ceiling (the 1/alpha_t clamp in NEMIXModel.loss).
+
+    This must NOT reach its final value on the same schedule as t_max.
+    Once t_max hits 1.0, ~20% of batches draw t close to 1 and receive the
+    full weight ceiling on every masked position -- at the exact step the
+    model also starts seeing its hardest masking ratios for the first
+    time. Under a 1-2 layer decoder, that combination (hardest masking +
+    heaviest per-token weight, both arriving simultaneously with no
+    transition) is enough to collapse training into predicting the single
+    highest-frequency corpus token everywhere -- observed as all-newline /
+    all-underscore output and a loss plateau that never recovers even
+    after thousands of further steps.
+
+    Fix: ramp the weight ceiling on its own, slower schedule (default 2x
+    the mask warmup) so high-mask-ratio batches are only lightly
+    up-weighted until the model already has some denoising signal to
+    build on."""
+    weight_warmup_steps = getattr(cfg, "elbo_weight_warmup_steps",
+                                  2 * max(1, cfg.mask_warmup_steps))
+    start = getattr(cfg, "elbo_min_weight", 1.5)
+    final = cfg.elbo_max_weight
+    if weight_warmup_steps <= 0:
+        return final
+    frac = min(1.0, step / weight_warmup_steps)
+    return start + (final - start) * frac
+
+
+@torch.no_grad()
+def evaluate_loss(model, val_dataloader, cfg, is_nemix, device, dtype,
+                  max_batches=20):
+    """Held-out loss, unweighted and with masking fixed at t_max=1.0 (the
+    hardest, most representative setting) so numbers are comparable across
+    checkpoints regardless of where the train-time curriculum happens to
+    be. This did not exist before -- there was no way to tell memorization
+    from generalization during training short of waiting for the run to
+    finish and eyeballing generated samples."""
+    model.eval()
+    total, n = 0.0, 0
+    for i, batch in enumerate(val_dataloader):
+        if i >= max_batches:
+            break
+        if is_nemix:
+            p = torch.tensor(batch["prompt_ids"], device=device)
+            t = torch.tensor(batch["target_ids"], device=device)
+            with _autocast_context(dtype, device):
+                out = model.loss(p, t, t_max=1.0, elbo_max_weight=cfg.elbo_max_weight)
+                loss = out["loss"]
+        else:
+            ids = torch.tensor(batch["input_ids"], device=device)
+            with _autocast_context(dtype, device):
+                x, y = ids[:, :-1], ids[:, 1:]
+                loss = F.cross_entropy(
+                    model(x).reshape(-1, model.head.out_features),
+                    y.reshape(-1), ignore_index=cfg.pad_id,
+                )
+        total += float(loss.item())
+        n += 1
+    model.train()
+    return total / max(n, 1)
+
+
 def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
-              max_steps=None):
+              max_steps=None, val_dataloader=None, eval_every=250):
+    """val_dataloader: optional held-out batches (same schema as
+    dataloader). When given, validation loss is computed every
+    eval_every steps and the train/val gap is printed -- a growing gap
+    is the concrete signal that the model is starting to memorize rather
+    than generalize, which previously had no instrumentation at all."""
     device = resolve_device(cfg)
     dtype = resolve_dtype(cfg, device)
     model.to(device)
+
+    if is_nemix and hasattr(model, "backbone"):
+        mixer_kind = model.backbone.mixer_kind()
+        print(f"NEMIX mixer: {mixer_kind}", flush=True)
+        if mixer_kind != "gated_deltanet":
+            print("WARNING: this run is NOT using Gated DeltaNet -- results "
+                  "are not a valid test of the NEMIX architecture.", flush=True)
+
     if cfg.use_compile and hasattr(torch, "compile") and device == "cuda":
         model = torch.compile(model, mode="max-autotune")
 
@@ -111,8 +186,9 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
                 p = torch.tensor(batch["prompt_ids"], device=device)
                 t = torch.tensor(batch["target_ids"], device=device)
                 t_max = _t_max_curriculum(step, cfg)
+                elbo_w = _elbo_weight_curriculum(step, cfg)
                 with _autocast_context(dtype, device):
-                    out = model.loss(p, t, t_max=t_max)
+                    out = model.loss(p, t, t_max=t_max, elbo_max_weight=elbo_w)
                     loss = out["loss"]
             else:
                 ids = torch.tensor(batch["input_ids"], device=device)
@@ -143,7 +219,13 @@ def train_any(model, dataloader, cfg, is_nemix=True, save_path=None,
                 sched.step()
                 step += 1
                 if step % 50 == 0:
-                    print(f"epoch {epoch} step {step} loss {running:.4f}", flush=True)
+                    extra = f" mask {out['mask_frac']:.2f} t_max {t_max:.2f} elbo_w {elbo_w:.2f}" if is_nemix else ""
+                    print(f"epoch {epoch} step {step} loss {running:.4f}{extra}", flush=True)
+                if val_dataloader is not None and step % eval_every == 0:
+                    val_loss = evaluate_loss(model, val_dataloader, cfg, is_nemix, device, dtype)
+                    gap = val_loss - running
+                    print(f"epoch {epoch} step {step} val_loss {val_loss:.4f} "
+                         f"train_val_gap {gap:+.4f}", flush=True)
                 running = 0.0
                 if save_path and step % 500 == 0:
                     torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, save_path)

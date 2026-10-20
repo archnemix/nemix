@@ -44,9 +44,17 @@ class RecurrentDepth(nn.Module):
         cumulative = torch.zeros(B, L, device=x.device)
         halted = torch.zeros(B, L, dtype=torch.bool, device=x.device)
         ponder = x.new_zeros(())
+        # Same dead-flag issue as NEMIXBackbone.stream: use_gradient_checkpointing
+        # was never read here either, despite this being the module that
+        # re-runs its blocks max_loop_iters times -- the single deepest,
+        # most activation-memory-hungry part of the forward graph.
+        use_ckpt = (getattr(cfg, "use_gradient_checkpointing", False)
+                   and self.training and torch.is_grad_enabled())
+        if use_ckpt:
+            from torch.utils.checkpoint import checkpoint
         for _ in range(cfg.max_loop_iters):
             for layer in self.blocks:
-                x = layer(x)
+                x = checkpoint(layer, x, use_reentrant=False) if use_ckpt else layer(x)
             if cfg.use_act:
                 p = torch.sigmoid(self.halt(x)).squeeze(-1)
                 still = ~halted
@@ -90,11 +98,21 @@ class NEMIXModel(nn.Module):
     # ------------------------------------------------------------------
     # MDLM Rao-Blackwellized loss
     # ------------------------------------------------------------------
-    def loss(self, prompt_ids, target_ids, t_max: float = 1.0):
+    def loss(self, prompt_ids, target_ids, t_max: float = 1.0,
+              elbo_max_weight: float | None = None):
         """t ~ U(0, t_max); alpha_t = 1 - t; mask probability = t.
         Loss only on masked positions, weighted by 1/alpha_t clamped to
-        cfg.elbo_max_weight.  t_max is the curriculum upper bound: start
-        at ~0.15 and anneal to 1.0."""
+        elbo_max_weight (defaults to cfg.elbo_max_weight if not given).
+        t_max is the mask-ratio curriculum upper bound: start at ~0.15 and
+        anneal to 1.0.  elbo_max_weight should be annealed on its OWN,
+        slower schedule (see train._elbo_weight_curriculum) -- if it is
+        already at its final value by the time t_max reaches 1.0, the
+        model gets hit with both its hardest masking ratios and its
+        heaviest per-token loss weight at the same step, which collapses
+        training to predicting the single highest-frequency token
+        everywhere."""
+        if elbo_max_weight is None:
+            elbo_max_weight = self.cfg.elbo_max_weight
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
             target_ids = target_ids.unsqueeze(0)
@@ -132,8 +150,8 @@ class NEMIXModel(nn.Module):
         ).reshape(B, T)
 
         # ---- Rao-Blackwellized weight 1/alpha_t, clamped ---------------
-        alpha = (1.0 - t).clamp_min(1.0 / self.cfg.elbo_max_weight)  # [B]
-        weight = (1.0 / alpha).unsqueeze(1)                          # [B, 1]
+        alpha = (1.0 - t).clamp_min(1.0 / elbo_max_weight)  # [B]
+        weight = (1.0 / alpha).unsqueeze(1)                 # [B, 1]
 
         denom = masked.float().sum().clamp_min(1.0)
         nll = (ce * masked.float() * weight).sum() / denom
@@ -151,10 +169,25 @@ class NEMIXModel(nn.Module):
         return {"loss": loss, "acc": acc.item(), "nll": nll.item(),
                 "mask_frac": masked.float().mean().item()}
 
-    def generate(self, prompt_ids, out_len, **kwargs):
+    def generate(self, prompt_ids, out_len, prompt_text=None,
+                novelty_lam=0.0, **kwargs):
+        """prompt_text: the original prompt string, if available, so the
+        decoder can auto-detect a 'give me a random X' request and switch
+        off argmax-only token selection for it (see refinement.refine's
+        sample_mode docs). Passing None preserves the previous behavior
+        exactly -- this is purely additive.
+
+        novelty_lam: >0 enables novelty-reweighted generation against
+        this model's own gist memory (self.backbone.memory), pushing
+        output away from content already stored there. 0.0 (default)
+        keeps generation unchanged from before -- this only activates
+        when explicitly requested, since memory contents depend entirely
+        on what stream() has written so far in this session."""
         squeeze = prompt_ids.dim() == 1
         prompt_hidden, _ = self._encode_prompt(prompt_ids)
-        res = self.decoder.refine(prompt_hidden, out_len, **kwargs)
+        res = self.decoder.refine(prompt_hidden, out_len, prompt_text=prompt_text,
+                                  backbone=self.backbone if novelty_lam > 0 else None,
+                                  novelty_lam=novelty_lam, **kwargs)
         if squeeze:
             res["tokens"] = res["tokens"][0]
         return res

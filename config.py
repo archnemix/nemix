@@ -5,10 +5,14 @@ from dataclasses import dataclass
 @dataclass
 class NEMIXConfig:
     # ---- vocabulary -------------------------------------------------
-    # Reserved slots past the deepseek-coder tokenizer range (0..32255).
-    # mask_id/pad_id/bos_id/eos_id must NOT collide with real tokens or
-    # CE against a target that happens to be mask_id produces +inf → NaN.
-    vocab_size: int = 32260
+    # The deepseek-coder tokenizer emits token IDs in [0, 32255].
+    # Slots 32256..32263 are reserved for the model's special tokens so
+    # mask/pad/bos/eos NEVER collide with a real target token.  If they
+    # did (e.g. mask_id=1 where token 1 is real code), CE against a
+    # target that happens to be mask_id produces +inf, and nn.Embedding
+    # crashes on out-of-bounds index.  vocab_size must be > every *_id
+    # below or the embedding lookup fails at the first forward pass.
+    vocab_size: int = 32264
     pad_id: int = 32257
     mask_id: int = 32256
     bos_id: int = 32258
@@ -39,10 +43,19 @@ class NEMIXConfig:
     revise_margin: float = 0.05
     insert_alpha: float = 1.7
     max_insertions_per_step: int = 8
+    # Previously 0.0 -- the decoder's only built-in regularizer was
+    # disabled by default, so nothing pushed the model away from
+    # memorizing the exact training examples. A small nonzero dropout is
+    # cheap insurance toward generalization and does not materially slow
+    # a 20M-param model.
+    decoder_dropout: float = 0.1
     delete_floor: float = 0.01
 
     # ---- MDM / Rao-Blackwellized loss -------------------------------
     elbo_max_weight: float = 5.0
+    elbo_min_weight: float = 1.5     # starting value of the weight-ceiling ramp
+    elbo_weight_warmup_steps: int = 1000  # must be >= mask_warmup_steps; see
+                                           # train._elbo_weight_curriculum for why
     mask_warmup_start: float = 0.15
     mask_warmup_steps: int = 500
     aux_weight: float = 0.0
